@@ -14,9 +14,9 @@ _MODELS_YAML = (
 
 def run_split(
     project_path,
-    train_fraction=0.7,
-    val_fraction=0.15,
-    seed=88,
+    train_fraction=None,
+    val_fraction=None,
+    seed=None,
     train_mode="segment",
     dry_run=False,
 ):
@@ -33,13 +33,16 @@ def run_split(
     ----------
     project_path : str or Path
         Path to the OCTRON project directory.
-    train_fraction : float
-        Fraction of frames assigned to the training split (default 0.7).
-    val_fraction : float
-        Fraction of frames assigned to the validation split (default 0.15).
-        The remainder becomes the test split.
-    seed : int
-        Random seed for reproducibility (default 88).
+    train_fraction : float or None
+        Fraction of frames for the training split. ``None`` (the CLI
+        default) reads ``split_train_fraction`` from ``config.yaml``.
+    val_fraction : float or None
+        Fraction of frames for the validation split; the remainder
+        becomes the test split. ``None`` reads ``split_val_fraction``
+        from config.
+    seed : int or None
+        Random seed for reproducibility. ``None`` reads ``split_seed``
+        from config.
     train_mode : str
         ``'segment'`` for instance segmentation, ``'detect'`` for bounding-box
         detection only.
@@ -52,6 +55,21 @@ def run_split(
     train_mode = (
         train_mode.value if hasattr(train_mode, "value") else str(train_mode)
     )
+
+    # Resolve unset split parameters from config.yaml. Precedence: a CLI
+    # flag (non-None) overrides config, which overrides the built-in
+    # default. The GUI reads the same config for its defaults.
+    if train_fraction is None or val_fraction is None or seed is None:
+        from octron import config
+
+        if train_fraction is None or val_fraction is None:
+            cfg_train, cfg_val = config.get_split_fractions()
+            if train_fraction is None:
+                train_fraction = cfg_train
+            if val_fraction is None:
+                val_fraction = cfg_val
+        if seed is None:
+            seed = config.get_split_seed()
 
     # Validate fractions up front using the core guard (also enforced
     # inside prepare_split) so the CLI fails before any model, label, or
@@ -75,18 +93,12 @@ def run_split(
         if train_mode == "segment"
         else "Generating bounding boxes..."
     )
-    for (
-        no_entry,
-        total,
-        label,
-        frame_no,
-        total_frames,
-    ) in yolo.prepare_geometry():
-        print(
-            f"  [{no_entry}/{total}] {label}: frame {frame_no}/{total_frames}",
-            end="\r",
-        )
-    print()
+    # tqdm (inside prepare_geometry) renders the per-label progress bar on
+    # stderr. We only drive the generator here; printing our own
+    # carriage-return line to stdout in lockstep with tqdm makes the bar
+    # "staircase" onto new lines (most visibly on Windows).
+    for _ in yolo.prepare_geometry():
+        pass
 
     # --- Step 3: split ---
     print("Splitting data into train/val/test sets...")
@@ -96,8 +108,10 @@ def run_split(
         random_seed=seed,
     )
 
-    # Print summary table
-    _print_split_summary(yolo.label_dict, seed)
+    # Print summary table + colored whole-video timelines (shared w/ GUI)
+    from octron.yolo_octron.helpers.split_report import render_split_report
+
+    render_split_report(yolo.summarize_split(), seed)
 
     if dry_run:
         print("Dry run — no files written.")
@@ -105,72 +119,10 @@ def run_split(
 
     # --- Step 4: export to disk ---
     print("Exporting training data...")
-    for (
-        no_entry,
-        total,
-        label,
-        split,
-        frame_no,
-        total_frames,
-    ) in yolo.create_training_data():
-        print(
-            f"  [{no_entry}/{total}] {label} ({split}): "
-            f"frame {frame_no}/{total_frames}",
-            end="\r",
-        )
-    print()
+    # As above: tqdm owns the export progress bar; we just consume the
+    # generator so a competing stdout writer can't break the bar.
+    for _ in yolo.create_training_data():
+        pass
 
     yolo.write_yolo_config(train_mode=train_mode)
     print("Training data export complete.")
-
-
-def _print_split_summary(label_dict, seed):
-    """Print a per-label, per-split frame count table."""
-    rows = []
-    for subfolder, labels in label_dict.items():
-        for entry, info in labels.items():
-            if entry in ("video", "video_file_path"):
-                continue
-            split = info.get("frames_split", {})
-            rows.append(
-                (
-                    Path(subfolder).name,
-                    info["label"],
-                    len(split.get("train", [])),
-                    len(split.get("val", [])),
-                    len(split.get("test", [])),
-                    len(info["frames"]),
-                )
-            )
-
-    if not rows:
-        return
-
-    col_w = [max(len(str(r[i])) for r in rows) for i in range(6)]
-    col_w = [
-        max(w, h) for w, h in zip(col_w, [8, 5, 5, 3, 4, 5], strict=False)
-    ]
-    header = (
-        f"{'Subfolder':{col_w[0]}}  "
-        f"{'Label':{col_w[1]}}  "
-        f"{'Train':>{col_w[2]}}  "
-        f"{'Val':>{col_w[3]}}  "
-        f"{'Test':>{col_w[4]}}  "
-        f"{'Total':>{col_w[5]}}"
-    )
-    sep = "-" * len(header)
-    print(f"\nSplit summary  (seed={seed})")
-    print(sep)
-    print(header)
-    print(sep)
-    for subfolder, label, tr, va, te, tot in rows:  # codespell:ignore te
-        print(
-            f"{subfolder:{col_w[0]}}  "
-            f"{label:{col_w[1]}}  "
-            f"{tr:>{col_w[2]}}  "
-            f"{va:>{col_w[3]}}  "
-            f"{te:>{col_w[4]}}  "  # codespell:ignore te
-            f"{tot:>{col_w[5]}}"
-        )
-    print(sep)
-    print()

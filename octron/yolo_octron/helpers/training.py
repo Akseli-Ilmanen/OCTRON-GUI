@@ -598,33 +598,258 @@ def draw_polygons(
             counter += 1
 
 
+def _allocate_split_blocks(n_blocks, validation_fraction, test_fraction):
+    """Return ``(n_train, n_val, n_test)`` block counts, each at least 1.
+
+    Fractions are applied at block granularity; val and test each keep at
+    least one block and are trimmed so train keeps at least one too.
+    """
+    n_val = max(1, round(validation_fraction * n_blocks))
+    n_test = max(1, round(test_fraction * n_blocks))
+    while n_val + n_test >= n_blocks:
+        if n_test >= n_val and n_test > 1:
+            n_test -= 1
+        elif n_val > 1:
+            n_val -= 1
+        else:
+            break
+    return n_blocks - n_val - n_test, n_val, n_test
+
+
+def _blocks_to_splits(blocks, split_labels, buffer):
+    """Group contiguous blocks into per-split frame-index lists.
+
+    ``split_labels[b]`` is the split name for block ``b``. When ``buffer``
+    is > 0 the leading ``buffer`` frames of a block are dropped whenever
+    the previous block belongs to a different split, creating a temporal
+    gap so no adjacent near-duplicate pair straddles the split.
+    """
+    buckets = {"train": [], "val": [], "test": []}
+    for b, block in enumerate(blocks):
+        blk = block
+        if buffer and b > 0 and split_labels[b] != split_labels[b - 1]:
+            blk = blk[buffer:]
+        if len(blk):
+            buckets[split_labels[b]].append(blk)
+    return buckets
+
+
+def _concat_blocks(parts, dtype):
+    """Concatenate frame-index arrays; empty input -> empty array."""
+    if parts:
+        return np.concatenate(parts)
+    return np.array([], dtype=dtype)
+
+
+def _assert_valid_split(split_dict, sorted_frames):
+    """Assert splits are non-empty, disjoint, and a subset of the input."""
+    seen: set[int] = set()
+    for name, frames in split_dict.items():
+        assert len(frames) > 0, f"Empty {name} split"
+        fset = {int(f) for f in frames}
+        assert not (fset & seen), "Splits overlap"
+        seen |= fset
+    assert seen.issubset({int(f) for f in sorted_frames}), (
+        "Split contains frames not present in the input"
+    )
+
+
+def _segment_episodes(sorted_frames, gap_threshold, gap_factor, block_size):
+    """Split sorted frames into episodes at large temporal gaps.
+
+    An episode boundary is a jump between consecutive annotated frames that
+    is much larger than the typical spacing, so annotation bursts recorded
+    in different parts of a video become separate episodes. When
+    ``gap_threshold`` is None it is derived from the data as
+    ``max(block_size, gap_factor * p90(diffs))`` -- a high percentile so a
+    sparser episode's normal skip spacing is not mistaken for a boundary.
+    """
+    if len(sorted_frames) < 2:
+        return [sorted_frames]
+    diffs = np.diff(sorted_frames)
+    if gap_threshold is None:
+        typical = np.percentile(diffs, 90)
+        threshold = max(block_size, round(gap_factor * typical))
+    else:
+        threshold = gap_threshold
+    boundaries = np.where(diffs > threshold)[0]
+    if len(boundaries) == 0:
+        return [sorted_frames]
+    return np.split(sorted_frames, boundaries + 1)
+
+
+def _block_split(
+    frames, training_fraction, validation_fraction, rng, block_size, buffer
+):
+    """Contiguous-block split of one already-sorted frame run.
+
+    Cuts ``frames`` into at least 3 contiguous blocks (~``block_size``
+    each), assigns whole blocks to train/val/test with ``rng`` (so val and
+    test are spread across the run), and drops ``buffer`` frames at
+    boundaries between differently-assigned blocks. ``frames`` must have at
+    least 3 entries.
+    """
+    n = len(frames)
+    n_blocks = max(3, min(n, round(n / max(1, block_size))))
+    blocks = np.array_split(frames, n_blocks)
+    n_blocks = len(blocks)
+    eff_buffer = buffer if min(len(b) for b in blocks) > buffer else 0
+
+    test_fraction = 1.0 - training_fraction - validation_fraction
+    _, n_val, n_test = _allocate_split_blocks(
+        n_blocks, validation_fraction, test_fraction
+    )
+    perm = rng.permutation(n_blocks)
+    labels = np.array(["train"] * n_blocks, dtype="<U5")
+    labels[perm[:n_val]] = "val"
+    labels[perm[n_val : n_val + n_test]] = "test"
+    labels = labels.tolist()
+
+    buckets = _blocks_to_splits(blocks, labels, eff_buffer)
+    out = {k: _concat_blocks(v, frames.dtype) for k, v in buckets.items()}
+    # A split empties only if its single short block was fully consumed by
+    # the buffer; retry without the buffer (always non-empty).
+    if eff_buffer and any(len(v) == 0 for v in out.values()):
+        buckets = _blocks_to_splits(blocks, labels, 0)
+        out = {k: _concat_blocks(v, frames.dtype) for k, v in buckets.items()}
+    return out
+
+
+def _cut_into_blocks(frames, block_size):
+    """Cut one contiguous frame run into ~``block_size`` blocks."""
+    n_blocks = max(1, round(len(frames) / max(1, block_size)))
+    return np.array_split(frames, n_blocks)
+
+
+def _stratified_labels(n_blocks, n_val, n_test, rng):
+    """Label blocks so val and test are spread across the timeline.
+
+    The combined val+test *holdout* is placed one block per evenly-spaced
+    stratum over the whole block sequence, then those holdout blocks are
+    divided into val/test (also stratified). Spreading the holdout as a
+    whole -- rather than choosing val, then test, independently -- keeps
+    both splits distributed even when only one block of each is available
+    (otherwise a lone val and a lone test block often clump together and
+    leave a long train-only stretch). Picks use ``rng`` so the split is
+    reproducible yet seed-sensitive. Every non-holdout block is ``train``.
+    """
+
+    def pick_spread(pool, k):
+        return [int(rng.choice(s)) for s in np.array_split(pool, k)]
+
+    labels = np.array(["train"] * n_blocks, dtype="<U5")
+    all_idx = np.arange(n_blocks)
+    holdout = np.array(sorted(pick_spread(all_idx, n_val + n_test)))
+    test_slots = pick_spread(np.arange(len(holdout)), n_test)
+    is_test = np.zeros(len(holdout), dtype=bool)
+    is_test[test_slots] = True
+    labels[holdout[is_test]] = "test"
+    labels[holdout[~is_test]] = "val"
+    return labels.tolist()
+
+
+def _global_block_split(
+    episodes, training_fraction, validation_fraction, rng, block_size, buffer
+):
+    """Split episodes against a single global block budget.
+
+    Each episode is cut into ~``block_size`` contiguous blocks and all
+    blocks across episodes share one train/val/test budget, so the
+    realized proportions track the requested fractions regardless of how
+    many (or how small) the episodes are. val/test blocks are spread
+    across the timeline and the buffer is applied only within an episode
+    (never across the large gap between episodes). Returns ``None`` when
+    there are fewer than 3 blocks total so the caller can fall back to a
+    single-group split.
+    """
+    episode_blocks = [_cut_into_blocks(ep, block_size) for ep in episodes]
+    n_blocks = sum(len(b) for b in episode_blocks)
+    if n_blocks < 3:
+        return None
+
+    test_fraction = 1.0 - training_fraction - validation_fraction
+    _, n_val, n_test = _allocate_split_blocks(
+        n_blocks, validation_fraction, test_fraction
+    )
+    labels = _stratified_labels(n_blocks, n_val, n_test, rng)
+
+    buckets = {"train": [], "val": [], "test": []}
+    pos = 0
+    for blocks in episode_blocks:
+        ep_labels = labels[pos : pos + len(blocks)]
+        pos += len(blocks)
+        eff_buffer = buffer if min(len(b) for b in blocks) > buffer else 0
+        ep_buckets = _blocks_to_splits(blocks, ep_labels, eff_buffer)
+        for name in buckets:
+            buckets[name].extend(ep_buckets[name])
+    return buckets
+
+
 def train_test_val(
     frame_indices,
     training_fraction=0.8,
     validation_fraction=0.1,
     random_seed=88,
+    block_size=20,
+    buffer=1,
+    gap_threshold=None,
+    gap_factor=5.0,
     verbose=False,
 ):
-    """Perform a train-test-validation split on frame indices.
+    """Split frame indices into train/val/test by episode, then block.
+
+    SAM-assisted annotation (forward propagation)
+    lets users label many frames quickly, so the annotated set
+    is dominated by temporally adjacent, correlated frames -- often
+    across several annotation bursts ("episodes") in different parts of one
+    video. A fully random per-frame split places a frame and its close
+    neighbour on opposite sides of train/val (optimistic metrics) and lets
+    a denser episode dominate val/test.
+
+    This splits by *contiguous blocks pooled across episodes* instead:
+    frames are first segmented into episodes at large temporal gaps, each
+    episode is cut into small contiguous blocks, and all blocks across
+    episodes share one train/val/test budget so the realized proportions
+    match the requested fractions no matter how many (or how small) the
+    episodes are. The val/test blocks are spread across the timeline
+    (stratified) so they stay representative, temporally adjacent frames
+    stay on the same side, and a buffer of frames is dropped at block
+    boundaries within an episode to add a gap. Small episodes may fall
+    entirely in one split (usually train); they are not force-split three
+    ways.
 
     Parameters
     ----------
     frame_indices : np.array
-        Array of frame indices
+        Frame indices (need not be contiguous; sorted internally).
     training_fraction : float
-        Fraction of training data
+        Approximate fraction of blocks for training.
     validation_fraction : float
-        Fraction of validation data
+        Approximate fraction of blocks for validation; test is the
+        remainder.
     random_seed : int
-        Random seed for reproducibility
+        Seed for reproducible (timeline-spread) block assignment.
+    block_size : int
+        Target frames per contiguous block. Adapted down for small
+        episodes so at least 3 blocks (one per split) always exist.
+    buffer : int
+        Frames dropped at each boundary between differently-assigned
+        blocks. Disabled automatically when blocks are too small to spare
+        a frame.
+    gap_threshold : int or None
+        Frame gap above which a new episode begins. None derives it from
+        the data (see :func:`_segment_episodes`).
+    gap_factor : float
+        Multiplier used when deriving the automatic ``gap_threshold``.
     verbose : bool
-        Whether to print sizes of the splits
+        Whether to log split sizes.
 
     Returns
     -------
     split_dict : dict : Dictionary containing the splits
         keys: 'train', 'val', 'test'
-        values: np.array : Frame indices for each split
+        values: np.array : sorted frame indices for each split. Buffered
+        boundary frames are intentionally omitted from all splits.
 
     """
     assert training_fraction + validation_fraction < 1, (
@@ -633,55 +858,53 @@ def train_test_val(
     assert training_fraction > validation_fraction, (
         "Training fraction should be greater than validation fraction"
     )
-    assert len(frame_indices) >= 3, (
-        f"Need at least 3 frames to split into train/val/test, "
-        f"got {len(frame_indices)}"
+    frame_indices = np.asarray(frame_indices)
+    n = len(frame_indices)
+    assert n >= 3, (
+        f"Need at least 3 frames to split into train/val/test, got {n}"
     )
 
-    # Shuffle the indices
-    np.random.seed(random_seed)
-    shuffled_indices = np.random.permutation(len(frame_indices))
+    sorted_frames = np.sort(frame_indices)
+    episodes = _segment_episodes(
+        sorted_frames, gap_threshold, gap_factor, block_size
+    )
 
-    # Calculate split points, ensuring each split gets at least 1 frame
-    n = len(frame_indices)
-    train_size = max(1, int(training_fraction * n))
-    val_size = max(1, int(validation_fraction * n))
-    # Ensure test (remainder) also gets at least 1 frame
-    while train_size + val_size >= n:
-        train_size -= 1
+    rng = np.random.default_rng(random_seed)
+    buckets = _global_block_split(
+        episodes,
+        training_fraction,
+        validation_fraction,
+        rng,
+        block_size,
+        buffer,
+    )
+    dtype = sorted_frames.dtype
+    if buckets is not None:
+        split_dict = {k: _concat_blocks(v, dtype) for k, v in buckets.items()}
+    else:
+        split_dict = None
 
-    # Split the shuffled indices
-    train_indices = shuffled_indices[:train_size]
-    val_indices = shuffled_indices[train_size : train_size + val_size]
-    test_indices = shuffled_indices[train_size + val_size :]
-
-    # Get the actual frame numbers for each split
-    train_frames = frame_indices[train_indices]
-    val_frames = frame_indices[val_indices]
-    test_frames = frame_indices[test_indices]
+    # Fallback: too few blocks to spread three ways, or the buffer emptied
+    # val/test -- split the whole set as one contiguous block group.
+    if (
+        split_dict is None
+        or len(split_dict["val"]) == 0
+        or len(split_dict["test"]) == 0
+    ):
+        split_dict = _block_split(
+            sorted_frames,
+            training_fraction,
+            validation_fraction,
+            np.random.default_rng(random_seed),
+            block_size,
+            buffer,
+        )
 
     if verbose:
-        logger.info(f"Total frames: {len(frame_indices)}")
-        logger.info(f"Training set: {len(train_frames)} frames")
-        logger.info(f"Validation set: {len(val_frames)} frames")
-        logger.info(f"Test set: {len(test_frames)} frames")
+        logger.info(f"Total frames: {n} in {len(episodes)} episode(s)")
+        logger.info(f"Training set: {len(split_dict['train'])} frames")
+        logger.info(f"Validation set: {len(split_dict['val'])} frames")
+        logger.info(f"Test set: {len(split_dict['test'])} frames")
 
-    split_dict = {
-        "train": train_frames,
-        "val": val_frames,
-        "test": test_frames,
-    }
-
-    # Sanity check
-    collected_frames = []
-    for frames in split_dict.values():
-        assert len(frames) > 0, "Empty split found"
-        collected_frames.extend(frames)
-    assert len(collected_frames) == len(frame_indices), (
-        "Not all frames were collected in the splits"
-    )
-    assert set(collected_frames) == set(frame_indices), (
-        "Some frames are missing in the splits"
-    )
-
+    _assert_valid_split(split_dict, sorted_frames)
     return split_dict

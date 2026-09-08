@@ -607,11 +607,10 @@ class YOLO_octron:
                         if len(common_valid) < old_count:
                             n_dropped = old_count - len(common_valid)
                             label_name = labels[entry]["label"]
-                            print(
-                                f"Warning: {n_dropped} frame(s) "
-                                f"dropped for label '{label_name}' "
-                                f"(empty polygons in at least "
-                                f"one label)"
+                            logger.warning(
+                                f"{n_dropped} frame(s) dropped for "
+                                f"label '{label_name}' (empty polygons "
+                                f"in at least one label)"
                             )
                         labels[entry]["frames"] = common_valid
             else:
@@ -624,8 +623,8 @@ class YOLO_octron:
                     if len(valid_frames) < len(frames):
                         n_dropped = len(frames) - len(valid_frames)
                         label_name = labels[entry]["label"]
-                        print(
-                            f"Warning: {n_dropped} frame(s) for label "
+                        logger.warning(
+                            f"{n_dropped} frame(s) for label "
                             f"'{label_name}' had no valid polygons "
                             f"and were excluded"
                         )
@@ -839,11 +838,10 @@ class YOLO_octron:
                         if len(common_valid) < old_count:
                             n_dropped = old_count - len(common_valid)
                             label_name = labels[entry]["label"]
-                            print(
-                                f"Warning: {n_dropped} frame(s) "
-                                f"dropped for label '{label_name}' "
-                                f"(empty bboxes in at least "
-                                f"one label)"
+                            logger.warning(
+                                f"{n_dropped} frame(s) dropped for "
+                                f"label '{label_name}' (empty bboxes "
+                                f"in at least one label)"
                             )
                         labels[entry]["frames"] = common_valid
             else:
@@ -856,8 +854,8 @@ class YOLO_octron:
                     if len(valid_frames) < len(frames):
                         n_dropped = len(frames) - len(valid_frames)
                         label_name = labels[entry]["label"]
-                        print(
-                            f"Warning: {n_dropped} frame(s) for label "
+                        logger.warning(
+                            f"{n_dropped} frame(s) for label "
                             f"'{label_name}' had no valid bounding "
                             f"boxes and were excluded"
                         )
@@ -937,6 +935,24 @@ class YOLO_octron:
                 )
 
                 labels[entry]["frames_split"] = split_dict
+
+    def summarize_split(self):
+        """Return structured train/val/test split report data.
+
+        See
+        :func:`octron.yolo_octron.helpers.split_report.build_split_report`
+        for the structure. Call after :meth:`prepare_split` and before
+        export (the report reads mask lengths, which export pops).
+        """
+        from octron.yolo_octron.helpers.split_report import (
+            build_split_report,
+        )
+
+        if self.label_dict is None:
+            raise ValueError(
+                "No labels found. Please run prepare_labels() first."
+            )
+        return build_split_report(self.label_dict)
 
     def create_training_data_segment(
         self,
