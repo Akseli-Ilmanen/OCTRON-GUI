@@ -121,19 +121,19 @@ def find_common_frames(frame_arrays):
 
 
 def prune_frames_by_geometry(labels, prune_empty_labels, geometry_key):
-    """Drop frames whose geometry (``geometry_key``) came out empty.
+    """Drop frames whose geometry (geometry_key) came out empty.
 
-    ``geometry_key`` is ``"polygons"`` (segment) or ``"bboxes"``
-    (detect). A frame is *valid* for a label when
-    ``labels[label][geometry_key][frame]`` is a non-empty list (i.e. the
-    mask produced at least one polygon/bounding box).
+    geometry_key is "polygons" (segment) or "bboxes" (detect). A frame is
+    valid for a label when labels[label][geometry_key][frame] is a
+    non-empty list (i.e. the mask produced at least one polygon/bounding
+    box).
 
-    With ``prune_empty_labels=True`` the kept set is the **cross-label
-    intersection** of valid frames, so every label shares one frame set
-    and no near-duplicate frame ends up on opposite sides of the
-    train/val/test split. With ``prune_empty_labels=False`` each label is
-    pruned independently. Mutates ``labels`` in place, rewriting
-    ``labels[label]["frames"]``.
+    With prune_empty_labels=True the kept set is the cross-label
+    intersection of valid frames, so every label shares one frame set and
+    no near-duplicate frame ends up on opposite sides of the
+    train/val/test split. With prune_empty_labels=False each label is
+    pruned independently. Mutates labels in place, rewriting
+    labels[label]["frames"].
     """
     entries = [e for e in labels if e not in ("video", "video_file_path")]
     noun = "bounding boxes" if geometry_key == "bboxes" else geometry_key
