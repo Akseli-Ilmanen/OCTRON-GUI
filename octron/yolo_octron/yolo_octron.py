@@ -56,6 +56,7 @@ from octron.yolo_octron.helpers.polygons import (
 from octron.yolo_octron.helpers.training import (
     collect_labels,
     pick_random_frames,
+    prune_frames_by_geometry,
     train_test_val,
 )
 from octron.yolo_octron.helpers.yolo_checks import check_yolo_models
@@ -580,55 +581,12 @@ class YOLO_octron:
 
                 labels[entry]["polygons"] = polys
 
-            # Prune frames that produced no valid polygons.
-            # When prune_empty_labels is True, use cross-label intersection
-            # to keep frame sets synchronized (prevents train/val/test
-            # data leakage).
-            # Otherwise, prune each label independently.
-            label_entries = [
-                e for e in labels if e not in ("video", "video_file_path")
-            ]
-            if self.prune_empty_labels:
-                valid_per_label = []
-                for entry in label_entries:
-                    polys = labels[entry].get("polygons", {})
-                    valid = {
-                        int(f)
-                        for f in labels[entry]["frames"]
-                        if len(polys.get(f, [])) > 0
-                    }
-                    valid_per_label.append(valid)
-                if valid_per_label:
-                    common_valid = np.array(
-                        sorted(set.intersection(*valid_per_label))
-                    )
-                    for entry in label_entries:
-                        old_count = len(labels[entry]["frames"])
-                        if len(common_valid) < old_count:
-                            n_dropped = old_count - len(common_valid)
-                            label_name = labels[entry]["label"]
-                            logger.warning(
-                                f"{n_dropped} frame(s) dropped for "
-                                f"label '{label_name}' (empty polygons "
-                                f"in at least one label)"
-                            )
-                        labels[entry]["frames"] = common_valid
-            else:
-                for entry in label_entries:
-                    frames = labels[entry]["frames"]
-                    polys = labels[entry].get("polygons", {})
-                    valid_frames = np.array(
-                        [f for f in frames if len(polys.get(f, [])) > 0]
-                    )
-                    if len(valid_frames) < len(frames):
-                        n_dropped = len(frames) - len(valid_frames)
-                        label_name = labels[entry]["label"]
-                        logger.warning(
-                            f"{n_dropped} frame(s) for label "
-                            f"'{label_name}' had no valid polygons "
-                            f"and were excluded"
-                        )
-                        labels[entry]["frames"] = valid_frames
+            # Drop frames whose polygons came out empty (cross-label
+            # intersection when pruning, else per label). Shared with
+            # prepare_bboxes via prune_frames_by_geometry.
+            prune_frames_by_geometry(
+                labels, self.prune_empty_labels, "polygons"
+            )
 
     def prepare_bboxes(self):
         """Calculate bounding boxes for each mask in each label of label_dict.
@@ -814,52 +772,9 @@ class YOLO_octron:
 
                 labels[entry]["bboxes"] = bboxes_dict
 
-            # Prune frames that produced no valid bounding boxes.
-            # Same cross-label vs per-label logic as prepare_polygons.
-            label_entries = [
-                e for e in labels if e not in ("video", "video_file_path")
-            ]
-            if self.prune_empty_labels:
-                valid_per_label = []
-                for entry in label_entries:
-                    bboxes = labels[entry].get("bboxes", {})
-                    valid = {
-                        int(f)
-                        for f in labels[entry]["frames"]
-                        if len(bboxes.get(f, [])) > 0
-                    }
-                    valid_per_label.append(valid)
-                if valid_per_label:
-                    common_valid = np.array(
-                        sorted(set.intersection(*valid_per_label))
-                    )
-                    for entry in label_entries:
-                        old_count = len(labels[entry]["frames"])
-                        if len(common_valid) < old_count:
-                            n_dropped = old_count - len(common_valid)
-                            label_name = labels[entry]["label"]
-                            logger.warning(
-                                f"{n_dropped} frame(s) dropped for "
-                                f"label '{label_name}' (empty bboxes "
-                                f"in at least one label)"
-                            )
-                        labels[entry]["frames"] = common_valid
-            else:
-                for entry in label_entries:
-                    frames = labels[entry]["frames"]
-                    bboxes = labels[entry].get("bboxes", {})
-                    valid_frames = np.array(
-                        [f for f in frames if len(bboxes.get(f, [])) > 0]
-                    )
-                    if len(valid_frames) < len(frames):
-                        n_dropped = len(frames) - len(valid_frames)
-                        label_name = labels[entry]["label"]
-                        logger.warning(
-                            f"{n_dropped} frame(s) for label "
-                            f"'{label_name}' had no valid bounding "
-                            f"boxes and were excluded"
-                        )
-                        labels[entry]["frames"] = valid_frames
+            # Drop frames whose bboxes came out empty (shared with
+            # prepare_polygons via prune_frames_by_geometry).
+            prune_frames_by_geometry(labels, self.prune_empty_labels, "bboxes")
 
     def prepare_geometry(self):
         """Generate training geometry, dispatching on ``self.train_mode``.
@@ -906,13 +821,19 @@ class YOLO_octron:
         training_fraction=0.7,
         validation_fraction=0.15,
         random_seed=88,
+        buffer=1,
         verbose=False,
     ):
-        """Split frame indices into training, testing, and validation sets.
+        """Split frames into train/val/test, consistently across labels.
 
-        Uses train_test_val() to split the frame indices based on the
-        fractions provided. ``random_seed`` controls the shuffling so
-        splits are reproducible.
+        The split is decided once per frame over the union of all labels'
+        frames in each subfolder (via train_test_val), then each label's
+        frames_split is derived by filtering that one assignment to the
+        label's own frames. This keeps a frame in the SAME split for every
+        label (no cross-label leakage) regardless of pruning; pruning only
+        controls which frames are in the pool. random_seed makes the split
+        reproducible. buffer sets how many frames are dropped at each
+        train/val/test block boundary (forwarded to train_test_val).
         """
         self._validate_split_fractions(training_fraction, validation_fraction)
         if self.label_dict is None:
@@ -921,20 +842,47 @@ class YOLO_octron:
             )
 
         for labels in self.label_dict.values():
-            for entry in labels:
-                if entry == "video" or entry == "video_file_path":
-                    continue
-                # label = labels[entry]['label']
-                frames = labels[entry]["frames"]
-                split_dict = train_test_val(
-                    frames,
-                    training_fraction=training_fraction,
-                    validation_fraction=validation_fraction,
-                    random_seed=random_seed,
-                    verbose=verbose,
+            entries = [
+                e for e in labels if e not in ("video", "video_file_path")
+            ]
+            if not entries:
+                continue
+            # One split decision per frame over the union of every label's
+            # frames, so a frame shared by multiple labels always lands in
+            # the same split. A per-label split would otherwise send the
+            # same frame to train for one class and val for another,
+            # duplicating the image across split folders on export.
+            all_frames = np.unique(
+                np.concatenate(
+                    [np.asarray(labels[e]["frames"]) for e in entries]
                 )
+            )
+            union_split = train_test_val(
+                all_frames,
+                training_fraction=training_fraction,
+                validation_fraction=validation_fraction,
+                random_seed=random_seed,
+                buffer=buffer,
+                verbose=verbose,
+            )
+            frame_to_split = {}
+            for split_name in ("train", "val", "test"):
+                for f in union_split[split_name]:
+                    frame_to_split[int(f)] = split_name
 
-                labels[entry]["frames_split"] = split_dict
+            # Derive each label's split by filtering the global assignment
+            # to that label's frames. Buffered frames (dropped at block
+            # boundaries) map to nothing and are excluded everywhere.
+            for entry in entries:
+                buckets = {"train": [], "val": [], "test": []}
+                for f in labels[entry]["frames"]:
+                    split_name = frame_to_split.get(int(f))
+                    if split_name is not None:
+                        buckets[split_name].append(int(f))
+                labels[entry]["frames_split"] = {
+                    k: np.array(v, dtype=all_frames.dtype)
+                    for k, v in buckets.items()
+                }
 
     def summarize_split(self):
         """Return structured train/val/test split report data.

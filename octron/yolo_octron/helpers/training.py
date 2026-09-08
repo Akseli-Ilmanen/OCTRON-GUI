@@ -120,6 +120,62 @@ def find_common_frames(frame_arrays):
     return common
 
 
+def prune_frames_by_geometry(labels, prune_empty_labels, geometry_key):
+    """Drop frames whose geometry (geometry_key) came out empty.
+
+    geometry_key is "polygons" (segment) or "bboxes" (detect). A frame is
+    valid for a label when labels[label][geometry_key][frame] is a
+    non-empty list (i.e. the mask produced at least one polygon/bounding
+    box).
+
+    With prune_empty_labels=True the kept set is the cross-label
+    intersection of valid frames, so every label shares one frame set and
+    no near-duplicate frame ends up on opposite sides of the
+    train/val/test split. With prune_empty_labels=False each label is
+    pruned independently. Mutates labels in place, rewriting
+    labels[label]["frames"].
+    """
+    entries = [e for e in labels if e not in ("video", "video_file_path")]
+    noun = "bounding boxes" if geometry_key == "bboxes" else geometry_key
+    if prune_empty_labels:
+        valid_per_label = []
+        for entry in entries:
+            geom = labels[entry].get(geometry_key, {})
+            valid_per_label.append(
+                {
+                    int(f)
+                    for f in labels[entry]["frames"]
+                    if len(geom.get(f, [])) > 0
+                }
+            )
+        if not valid_per_label:
+            return
+        common_valid = np.array(sorted(set.intersection(*valid_per_label)))
+        for entry in entries:
+            old_count = len(labels[entry]["frames"])
+            if len(common_valid) < old_count:
+                logger.warning(
+                    f"{old_count - len(common_valid)} frame(s) dropped for "
+                    f"label '{labels[entry]['label']}' (empty "
+                    f"{geometry_key} in at least one label)"
+                )
+            labels[entry]["frames"] = common_valid
+    else:
+        for entry in entries:
+            frames = labels[entry]["frames"]
+            geom = labels[entry].get(geometry_key, {})
+            valid_frames = np.array(
+                [f for f in frames if len(geom.get(f, [])) > 0]
+            )
+            if len(valid_frames) < len(frames):
+                logger.warning(
+                    f"{len(frames) - len(valid_frames)} frame(s) for label "
+                    f"'{labels[entry]['label']}' had no valid {noun} "
+                    f"and were excluded"
+                )
+                labels[entry]["frames"] = valid_frames
+
+
 def pick_random_frames(frames, n=20):
     """Pick n random frames from a frames array without replacement.
 

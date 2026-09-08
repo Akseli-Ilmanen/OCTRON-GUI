@@ -623,10 +623,10 @@ class YoloHandler(QObject):
     def _split_and_report(self):
         """Split train/val/test from config and print the shared report.
 
-        Reads the split fractions/seed from ``config.yaml`` (the same
-        source the CLI defaults to) and prints the shared summary table +
-        colored timeline to the terminal that launched napari, so the GUI
-        and CLI show an identical split report.
+        Reads the split fractions/seed/buffer from ``config.yaml`` (the
+        same source the CLI defaults to) and prints the shared summary
+        table + colored timeline to the terminal that launched napari, so
+        the GUI and CLI show an identical split report.
         """
         from octron import config
         from octron.yolo_octron.helpers.split_report import (
@@ -635,10 +635,12 @@ class YoloHandler(QObject):
 
         train_frac, val_frac = config.get_split_fractions()
         seed = config.get_split_seed()
+        buffer = config.get_split_buffer()
         self.yolo.prepare_split(
             training_fraction=train_frac,
             validation_fraction=val_frac,
             random_seed=seed,
+            buffer=buffer,
         )
         render_split_report(self.yolo.summarize_split(), seed)
 

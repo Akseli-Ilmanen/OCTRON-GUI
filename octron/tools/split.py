@@ -17,6 +17,9 @@ def run_split(
     train_fraction=None,
     val_fraction=None,
     seed=None,
+    buffer=None,
+    prune=False,
+    watershed=False,
     train_mode="segment",
     dry_run=False,
 ):
@@ -43,6 +46,17 @@ def run_split(
     seed : int or None
         Random seed for reproducibility. ``None`` reads ``split_seed``
         from config.
+    buffer : int or None
+        Frames dropped at each train/val/test block boundary to add a
+        temporal gap between splits. ``None`` (the CLI default) reads
+        ``split_buffer`` from ``config.yaml``.
+    prune : bool
+        Drop frames where not all labels are annotated (threaded to
+        ``prepare_labels(prune_empty_labels=...)``). Default ``False``,
+        matching the GUI's Prune checkbox.
+    watershed : bool
+        Watershed touching same-label masks into separate instances
+        before geometry generation. Default ``False``.
     train_mode : str
         ``'segment'`` for instance segmentation, ``'detect'`` for bounding-box
         detection only.
@@ -59,7 +73,12 @@ def run_split(
     # Resolve unset split parameters from config.yaml. Precedence: a CLI
     # flag (non-None) overrides config, which overrides the built-in
     # default. The GUI reads the same config for its defaults.
-    if train_fraction is None or val_fraction is None or seed is None:
+    if (
+        train_fraction is None
+        or val_fraction is None
+        or seed is None
+        or buffer is None
+    ):
         from octron import config
 
         if train_fraction is None or val_fraction is None:
@@ -70,6 +89,8 @@ def run_split(
                 val_fraction = cfg_val
         if seed is None:
             seed = config.get_split_seed()
+        if buffer is None:
+            buffer = config.get_split_buffer()
 
     # Validate fractions up front using the core guard (also enforced
     # inside prepare_split) so the CLI fails before any model, label, or
@@ -81,10 +102,11 @@ def run_split(
         project_path=project_path,
     )
     yolo.train_mode = train_mode
+    yolo.enable_watershed = watershed
 
     # --- Step 1: collect labels ---
     print("Preparing labels...")
-    yolo.prepare_labels()
+    yolo.prepare_labels(prune_empty_labels=prune)
 
     # --- Step 2: generate geometry (polygons for segment, bboxes for
     # detect) ---
@@ -106,6 +128,7 @@ def run_split(
         training_fraction=train_fraction,
         validation_fraction=val_fraction,
         random_seed=seed,
+        buffer=buffer,
     )
 
     # Print summary table + colored whole-video timelines (shared w/ GUI)

@@ -26,6 +26,9 @@ def run_training(
     train_fraction=None,
     val_fraction=None,
     seed=None,
+    buffer=None,
+    prune=False,
+    watershed=False,
 ):
     """Run the OCTRON/YOLO training pipeline.
 
@@ -67,6 +70,15 @@ def run_training(
     seed : int or None
         Random seed for the split. ``None`` reads ``config.yaml``
         (ignored when ``skip_split=True``).
+    buffer : int or None
+        Frames dropped at each train/val/test block boundary. ``None``
+        reads ``config.yaml`` (ignored when ``skip_split=True``).
+    prune : bool
+        Drop frames where not all labels are annotated (ignored when
+        ``skip_split=True``). Default ``False``.
+    watershed : bool
+        Watershed touching same-label masks into separate instances
+        (ignored when ``skip_split=True``). Default ``False``.
 
     """
     from octron.test_gpu import auto_device
@@ -107,6 +119,9 @@ def run_training(
             train_fraction=train_fraction,
             val_fraction=val_fraction,
             seed=seed,
+            buffer=buffer,
+            prune=prune,
+            watershed=watershed,
             train_mode=train_mode,
             dry_run=False,
         )

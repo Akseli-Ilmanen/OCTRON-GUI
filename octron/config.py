@@ -178,6 +178,17 @@ SETTINGS: "tuple[SettingSpec, ...]" = (
         ),
         coerce=_coerce_nonneg_int,
     ),
+    SettingSpec(
+        key="split_buffer",
+        default=1,
+        kind="int",
+        description=(
+            "Frames dropped at each train/val/test block boundary to add a "
+            "temporal gap between splits (0 disables). Used when --buffer "
+            "is omitted, and by the GUI."
+        ),
+        coerce=_coerce_nonneg_int,
+    ),
 )
 
 _SPECS = {spec.key: spec for spec in SETTINGS}
@@ -395,3 +406,8 @@ def get_split_fractions() -> "tuple[float, float]":
 def get_split_seed() -> int:
     """Return the random seed for the train/val/test split."""
     return get_value("split_seed")
+
+
+def get_split_buffer() -> int:
+    """Return the buffer (frames dropped at split block boundaries)."""
+    return get_value("split_buffer")

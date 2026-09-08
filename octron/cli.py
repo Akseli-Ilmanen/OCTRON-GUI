@@ -277,6 +277,30 @@ def split(
         "--seed",
         help="Random seed for reproducibility (default: config.yaml).",
     ),
+    buffer: int | None = typer.Option(
+        None,
+        "--buffer",
+        help=(
+            "Frames dropped at each split block boundary for a temporal "
+            "gap between train/val/test (default: config.yaml)."
+        ),
+    ),
+    prune: bool = typer.Option(
+        False,
+        "--prune/--no-prune",
+        help=(
+            "Drop frames where not all labels are annotated "
+            "(default: off, matching the GUI)."
+        ),
+    ),
+    watershed: bool = typer.Option(
+        False,
+        "--watershed/--no-watershed",
+        help=(
+            "Watershed touching same-label masks into separate "
+            "instances (default: off)."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print split sizes without writing files."
     ),
@@ -289,6 +313,9 @@ def split(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        buffer=buffer,
+        prune=prune,
+        watershed=watershed,
         train_mode=train_mode,
         dry_run=dry_run,
     )
@@ -354,6 +381,30 @@ def train(
             "with --no-split)."
         ),
     ),
+    buffer: int | None = typer.Option(
+        None,
+        "--buffer",
+        help=(
+            "Frames dropped at each split block boundary (default: "
+            "config.yaml; ignored with --no-split)."
+        ),
+    ),
+    prune: bool = typer.Option(
+        False,
+        "--prune/--no-prune",
+        help=(
+            "Drop frames where not all labels are annotated "
+            "(default: off; ignored with --no-split)."
+        ),
+    ),
+    watershed: bool = typer.Option(
+        False,
+        "--watershed/--no-watershed",
+        help=(
+            "Watershed touching same-label masks into separate "
+            "instances (default: off; ignored with --no-split)."
+        ),
+    ),
 ):
     (
         """Prepare training data and run YOLO model training on an """
@@ -375,6 +426,9 @@ def train(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        buffer=buffer,
+        prune=prune,
+        watershed=watershed,
     )
 
 
