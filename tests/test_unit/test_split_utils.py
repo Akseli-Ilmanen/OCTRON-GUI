@@ -95,6 +95,55 @@ def test_run_split_accepts_valid_fractions():
     assert "fraction" not in str(exc.value).lower()
 
 
+def test_run_split_threads_prune_and_watershed(monkeypatch):
+    """run_split forwards prune/watershed to prepare_labels/enable_watershed.
+
+    Regression for the CLI/GUI parity gap (#90): run_split used to call
+    prepare_labels() with no args (always pruning) and never set
+    enable_watershed, so headless runs silently differed from the GUI.
+    """
+    recorded = {}
+    instances = []
+
+    class _FakeYolo:
+        def __init__(self, **kwargs):
+            self.train_mode = None
+            self.enable_watershed = None
+            self.label_dict = {}
+            instances.append(self)
+
+        @staticmethod
+        def _validate_split_fractions(train, val):
+            return None
+
+        def prepare_labels(self, prune_empty_labels=True, **kwargs):
+            recorded["prune"] = prune_empty_labels
+
+        def prepare_geometry(self):
+            return iter(())
+
+        def prepare_split(self, **kwargs):
+            pass
+
+        def summarize_split(self):
+            return []
+
+    monkeypatch.setattr(
+        "octron.yolo_octron.yolo_octron.YOLO_octron", _FakeYolo
+    )
+    run_split(
+        project_path="/nope_for_test",
+        train_fraction=0.7,
+        val_fraction=0.15,
+        seed=0,
+        prune=True,
+        watershed=True,
+        dry_run=True,
+    )
+    assert recorded["prune"] is True
+    assert instances[0].enable_watershed is True
+
+
 # ---------------------------------------------------------------------------
 # prepare_split threads the seed through to train_test_val
 # ---------------------------------------------------------------------------

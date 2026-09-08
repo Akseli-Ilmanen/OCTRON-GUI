@@ -277,6 +277,22 @@ def split(
         "--seed",
         help="Random seed for reproducibility (default: config.yaml).",
     ),
+    prune: bool = typer.Option(
+        False,
+        "--prune/--no-prune",
+        help=(
+            "Drop frames where not all labels are annotated "
+            "(default: off, matching the GUI)."
+        ),
+    ),
+    watershed: bool = typer.Option(
+        False,
+        "--watershed/--no-watershed",
+        help=(
+            "Watershed touching same-label masks into separate "
+            "instances (default: off)."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print split sizes without writing files."
     ),
@@ -289,6 +305,8 @@ def split(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        prune=prune,
+        watershed=watershed,
         train_mode=train_mode,
         dry_run=dry_run,
     )
@@ -354,6 +372,22 @@ def train(
             "with --no-split)."
         ),
     ),
+    prune: bool = typer.Option(
+        False,
+        "--prune/--no-prune",
+        help=(
+            "Drop frames where not all labels are annotated "
+            "(default: off; ignored with --no-split)."
+        ),
+    ),
+    watershed: bool = typer.Option(
+        False,
+        "--watershed/--no-watershed",
+        help=(
+            "Watershed touching same-label masks into separate "
+            "instances (default: off; ignored with --no-split)."
+        ),
+    ),
 ):
     (
         """Prepare training data and run YOLO model training on an """
@@ -375,6 +409,8 @@ def train(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        prune=prune,
+        watershed=watershed,
     )
 
 

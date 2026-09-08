@@ -17,6 +17,8 @@ def run_split(
     train_fraction=None,
     val_fraction=None,
     seed=None,
+    prune=False,
+    watershed=False,
     train_mode="segment",
     dry_run=False,
 ):
@@ -43,6 +45,13 @@ def run_split(
     seed : int or None
         Random seed for reproducibility. ``None`` reads ``split_seed``
         from config.
+    prune : bool
+        Drop frames where not all labels are annotated (threaded to
+        ``prepare_labels(prune_empty_labels=...)``). Default ``False``,
+        matching the GUI's Prune checkbox.
+    watershed : bool
+        Watershed touching same-label masks into separate instances
+        before geometry generation. Default ``False``.
     train_mode : str
         ``'segment'`` for instance segmentation, ``'detect'`` for bounding-box
         detection only.
@@ -81,10 +90,11 @@ def run_split(
         project_path=project_path,
     )
     yolo.train_mode = train_mode
+    yolo.enable_watershed = watershed
 
     # --- Step 1: collect labels ---
     print("Preparing labels...")
-    yolo.prepare_labels()
+    yolo.prepare_labels(prune_empty_labels=prune)
 
     # --- Step 2: generate geometry (polygons for segment, bboxes for
     # detect) ---

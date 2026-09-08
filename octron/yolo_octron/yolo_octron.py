@@ -56,6 +56,7 @@ from octron.yolo_octron.helpers.polygons import (
 from octron.yolo_octron.helpers.training import (
     collect_labels,
     pick_random_frames,
+    prune_frames_by_geometry,
     train_test_val,
 )
 from octron.yolo_octron.helpers.yolo_checks import check_yolo_models
@@ -580,55 +581,12 @@ class YOLO_octron:
 
                 labels[entry]["polygons"] = polys
 
-            # Prune frames that produced no valid polygons.
-            # When prune_empty_labels is True, use cross-label intersection
-            # to keep frame sets synchronized (prevents train/val/test
-            # data leakage).
-            # Otherwise, prune each label independently.
-            label_entries = [
-                e for e in labels if e not in ("video", "video_file_path")
-            ]
-            if self.prune_empty_labels:
-                valid_per_label = []
-                for entry in label_entries:
-                    polys = labels[entry].get("polygons", {})
-                    valid = {
-                        int(f)
-                        for f in labels[entry]["frames"]
-                        if len(polys.get(f, [])) > 0
-                    }
-                    valid_per_label.append(valid)
-                if valid_per_label:
-                    common_valid = np.array(
-                        sorted(set.intersection(*valid_per_label))
-                    )
-                    for entry in label_entries:
-                        old_count = len(labels[entry]["frames"])
-                        if len(common_valid) < old_count:
-                            n_dropped = old_count - len(common_valid)
-                            label_name = labels[entry]["label"]
-                            logger.warning(
-                                f"{n_dropped} frame(s) dropped for "
-                                f"label '{label_name}' (empty polygons "
-                                f"in at least one label)"
-                            )
-                        labels[entry]["frames"] = common_valid
-            else:
-                for entry in label_entries:
-                    frames = labels[entry]["frames"]
-                    polys = labels[entry].get("polygons", {})
-                    valid_frames = np.array(
-                        [f for f in frames if len(polys.get(f, [])) > 0]
-                    )
-                    if len(valid_frames) < len(frames):
-                        n_dropped = len(frames) - len(valid_frames)
-                        label_name = labels[entry]["label"]
-                        logger.warning(
-                            f"{n_dropped} frame(s) for label "
-                            f"'{label_name}' had no valid polygons "
-                            f"and were excluded"
-                        )
-                        labels[entry]["frames"] = valid_frames
+            # Drop frames whose polygons came out empty (cross-label
+            # intersection when pruning, else per label). Shared with
+            # prepare_bboxes via prune_frames_by_geometry.
+            prune_frames_by_geometry(
+                labels, self.prune_empty_labels, "polygons"
+            )
 
     def prepare_bboxes(self):
         """Calculate bounding boxes for each mask in each label of label_dict.
@@ -814,52 +772,9 @@ class YOLO_octron:
 
                 labels[entry]["bboxes"] = bboxes_dict
 
-            # Prune frames that produced no valid bounding boxes.
-            # Same cross-label vs per-label logic as prepare_polygons.
-            label_entries = [
-                e for e in labels if e not in ("video", "video_file_path")
-            ]
-            if self.prune_empty_labels:
-                valid_per_label = []
-                for entry in label_entries:
-                    bboxes = labels[entry].get("bboxes", {})
-                    valid = {
-                        int(f)
-                        for f in labels[entry]["frames"]
-                        if len(bboxes.get(f, [])) > 0
-                    }
-                    valid_per_label.append(valid)
-                if valid_per_label:
-                    common_valid = np.array(
-                        sorted(set.intersection(*valid_per_label))
-                    )
-                    for entry in label_entries:
-                        old_count = len(labels[entry]["frames"])
-                        if len(common_valid) < old_count:
-                            n_dropped = old_count - len(common_valid)
-                            label_name = labels[entry]["label"]
-                            logger.warning(
-                                f"{n_dropped} frame(s) dropped for "
-                                f"label '{label_name}' (empty bboxes "
-                                f"in at least one label)"
-                            )
-                        labels[entry]["frames"] = common_valid
-            else:
-                for entry in label_entries:
-                    frames = labels[entry]["frames"]
-                    bboxes = labels[entry].get("bboxes", {})
-                    valid_frames = np.array(
-                        [f for f in frames if len(bboxes.get(f, [])) > 0]
-                    )
-                    if len(valid_frames) < len(frames):
-                        n_dropped = len(frames) - len(valid_frames)
-                        label_name = labels[entry]["label"]
-                        logger.warning(
-                            f"{n_dropped} frame(s) for label "
-                            f"'{label_name}' had no valid bounding "
-                            f"boxes and were excluded"
-                        )
-                        labels[entry]["frames"] = valid_frames
+            # Drop frames whose bboxes came out empty (shared with
+            # prepare_polygons via prune_frames_by_geometry).
+            prune_frames_by_geometry(labels, self.prune_empty_labels, "bboxes")
 
     def prepare_geometry(self):
         """Generate training geometry, dispatching on ``self.train_mode``.
