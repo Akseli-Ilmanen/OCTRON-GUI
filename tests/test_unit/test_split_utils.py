@@ -179,6 +179,39 @@ def test_prepare_split_seed_changes_partition():
     assert _split_with_seed(frames, 1) != _split_with_seed(frames, 2)
 
 
+def _assigned_count_with_buffer(frames, buffer):
+    """Run prepare_split on a one-label fixture; count assigned frames."""
+    obj = YOLO_octron.__new__(YOLO_octron)
+    obj.label_dict = {
+        "sub": {
+            "video": None,
+            "video_file_path": None,
+            0: {"label": "a", "frames": np.array(frames)},
+        }
+    }
+    obj.prepare_split(
+        training_fraction=0.6,
+        validation_fraction=0.2,
+        random_seed=0,
+        buffer=buffer,
+    )
+    s = obj.label_dict["sub"][0]["frames_split"]
+    return sum(len(s[k]) for k in ("train", "val", "test"))
+
+
+def test_prepare_split_forwards_buffer():
+    """prepare_split threads buffer through to train_test_val.
+
+    buffer=0 keeps every frame (a single contiguous episode assigns all
+    frames to some split); buffer>0 drops frames at block boundaries, so
+    the assigned set shrinks. Regression: prepare_split used to ignore
+    buffer and always use train_test_val's default.
+    """
+    frames = list(range(200))
+    assert _assigned_count_with_buffer(frames, 0) == 200
+    assert _assigned_count_with_buffer(frames, 1) < 200
+
+
 # ---------------------------------------------------------------------------
 # train_test_val: contiguous-block split behaviour
 # ---------------------------------------------------------------------------

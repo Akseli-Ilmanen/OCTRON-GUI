@@ -277,6 +277,14 @@ def split(
         "--seed",
         help="Random seed for reproducibility (default: config.yaml).",
     ),
+    buffer: int | None = typer.Option(
+        None,
+        "--buffer",
+        help=(
+            "Frames dropped at each split block boundary for a temporal "
+            "gap between train/val/test (default: config.yaml)."
+        ),
+    ),
     prune: bool = typer.Option(
         False,
         "--prune/--no-prune",
@@ -305,6 +313,7 @@ def split(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        buffer=buffer,
         prune=prune,
         watershed=watershed,
         train_mode=train_mode,
@@ -372,6 +381,14 @@ def train(
             "with --no-split)."
         ),
     ),
+    buffer: int | None = typer.Option(
+        None,
+        "--buffer",
+        help=(
+            "Frames dropped at each split block boundary (default: "
+            "config.yaml; ignored with --no-split)."
+        ),
+    ),
     prune: bool = typer.Option(
         False,
         "--prune/--no-prune",
@@ -409,6 +426,7 @@ def train(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        buffer=buffer,
         prune=prune,
         watershed=watershed,
     )

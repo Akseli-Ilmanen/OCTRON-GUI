@@ -26,6 +26,7 @@ def run_training(
     train_fraction=None,
     val_fraction=None,
     seed=None,
+    buffer=None,
     prune=False,
     watershed=False,
 ):
@@ -69,6 +70,9 @@ def run_training(
     seed : int or None
         Random seed for the split. ``None`` reads ``config.yaml``
         (ignored when ``skip_split=True``).
+    buffer : int or None
+        Frames dropped at each train/val/test block boundary. ``None``
+        reads ``config.yaml`` (ignored when ``skip_split=True``).
     prune : bool
         Drop frames where not all labels are annotated (ignored when
         ``skip_split=True``). Default ``False``.
@@ -115,6 +119,7 @@ def run_training(
             train_fraction=train_fraction,
             val_fraction=val_fraction,
             seed=seed,
+            buffer=buffer,
             prune=prune,
             watershed=watershed,
             train_mode=train_mode,

@@ -168,6 +168,7 @@ def test_specs_includes_model_cache_dir(cfg_path):
 def test_split_defaults(cfg_path):
     assert config.get_split_fractions() == (0.7, 0.15)
     assert config.get_split_seed() == 88
+    assert config.get_split_buffer() == 1
 
 
 def test_split_fractions_and_seed_roundtrip(cfg_path):
@@ -197,6 +198,17 @@ def test_split_set_value_rejects_negative_seed(cfg_path):
         config.set_value("split_seed", -1)
 
 
+def test_split_buffer_roundtrip(cfg_path):
+    assert config.get_split_buffer() == 1
+    config.set_value("split_buffer", 3)
+    assert config.get_split_buffer() == 3
+
+
+def test_split_set_value_rejects_negative_buffer(cfg_path):
+    with pytest.raises(ValueError):
+        config.set_value("split_buffer", -1)
+
+
 def test_split_fractions_no_test_room_falls_back(cfg_path):
     # train + val >= 1 leaves no room for a test split -> defaults.
     config.set_value("split_train_fraction", 0.7)
@@ -210,4 +222,5 @@ def test_specs_includes_split_settings(cfg_path):
         "split_train_fraction",
         "split_val_fraction",
         "split_seed",
+        "split_buffer",
     } <= keys

@@ -9,10 +9,11 @@ Pruning happens in two stages, both gated by ``prune_empty_labels``:
    out empty via ``prune_frames_by_geometry`` (cross-label intersection
    when pruning, else per label).
 
-The pruned per-label ``frames`` then feed ``prepare_split`` /
-``train_test_val``, so pruning both shrinks the pool the fractions apply
-to and (when on) makes every label share one frame set, giving identical,
-leakage-free per-label splits.
+The pruned per-label ``frames`` then feed ``prepare_split``, which decides
+the split once per frame over the union of all labels' frames -- so a
+frame shared by several labels lands in the same split for every label
+(no cross-label leakage) regardless of pruning; pruning only controls
+which frames are in the pool.
 """
 
 import numpy as np
@@ -157,9 +158,20 @@ def test_prune_reduces_pool_and_unifies_splits():
     assert abs(len(sa["test"]) / tot - 0.15) < 0.06
 
 
-def test_no_prune_splits_are_independent_per_label():
-    # Without pruning, labels keep their own (different) frames and split
-    # independently, so the per-label splits differ.
+def _frame_to_split_map(split_dict):
+    """Map each assigned frame -> its split name for one label."""
+    mapping = {}
+    for name in ("train", "val", "test"):
+        for f in split_dict[name]:
+            mapping[int(f)] = name
+    return mapping
+
+
+def test_no_prune_shared_frames_get_one_split():
+    # Without pruning, labels keep their own (different) frames, but the
+    # split is decided per FRAME over their union: a frame shared by both
+    # labels lands in the SAME split for each (no cross-label leakage),
+    # and each label's split stays within its own frames.
     ld = _split_labels(
         {
             "sub": {
@@ -170,6 +182,13 @@ def test_no_prune_splits_are_independent_per_label():
             }
         }
     )
-    sa = ld["sub"][0]["frames_split"]
-    sb = ld["sub"][1]["frames_split"]
-    assert {int(x) for x in sa["train"]} != {int(x) for x in sb["train"]}
+    ma = _frame_to_split_map(ld["sub"][0]["frames_split"])
+    mb = _frame_to_split_map(ld["sub"][1]["frames_split"])
+    # Each label's assigned frames stay within its own annotated frames.
+    assert set(ma) <= set(range(0, 100))
+    assert set(mb) <= set(range(50, 150))
+    # Frames shared by both labels get the same split in both.
+    shared = set(ma) & set(mb)
+    assert shared
+    for f in shared:
+        assert ma[f] == mb[f]

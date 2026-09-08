@@ -7,11 +7,11 @@ Covered subcommands and flags
 ------------------------------
 gui         --help
 gpu-test    --help; gpu-test runs (skipped if torch DLLs unavailable)
-split       --help: --mode, --train, --val, --seed, --prune, --watershed,
-                    --dry-run
+split       --help: --mode, --train, --val, --seed, --buffer, --prune,
+                    --watershed, --dry-run
 train       --help: --model, --mode, --device, --epochs, --imagesz,
                     --save-period, --overwrite, --resume, --no-split,
-                    --train, --val, --seed, --prune, --watershed
+                    --train, --val, --seed, --buffer, --prune, --watershed
 predict     --help: --model, --tracker, --tracker-config, --device,
                     --conf-thresh, --iou-thresh, --skip-frames,
                     --one-object-per-label, --opening-radius, --overwrite,
@@ -128,6 +128,7 @@ def test_split_help():
     assert "--train" in out
     assert "--val" in out
     assert "--seed" in out
+    assert "--buffer" in out
     assert "--prune" in out
     assert "--no-prune" in out
     assert "--watershed" in out
@@ -156,6 +157,7 @@ def test_train_help():
     assert "--train" in out
     assert "--val" in out
     assert "--seed" in out
+    assert "--buffer" in out
     assert "--prune" in out
     assert "--no-prune" in out
     assert "--watershed" in out

@@ -821,13 +821,19 @@ class YOLO_octron:
         training_fraction=0.7,
         validation_fraction=0.15,
         random_seed=88,
+        buffer=1,
         verbose=False,
     ):
-        """Split frame indices into training, testing, and validation sets.
+        """Split frames into train/val/test, consistently across labels.
 
-        Uses train_test_val() to split the frame indices based on the
-        fractions provided. ``random_seed`` controls the shuffling so
-        splits are reproducible.
+        The split is decided once per frame over the union of all labels'
+        frames in each subfolder (via train_test_val), then each label's
+        frames_split is derived by filtering that one assignment to the
+        label's own frames. This keeps a frame in the SAME split for every
+        label (no cross-label leakage) regardless of pruning; pruning only
+        controls which frames are in the pool. random_seed makes the split
+        reproducible. buffer sets how many frames are dropped at each
+        train/val/test block boundary (forwarded to train_test_val).
         """
         self._validate_split_fractions(training_fraction, validation_fraction)
         if self.label_dict is None:
@@ -836,20 +842,47 @@ class YOLO_octron:
             )
 
         for labels in self.label_dict.values():
-            for entry in labels:
-                if entry == "video" or entry == "video_file_path":
-                    continue
-                # label = labels[entry]['label']
-                frames = labels[entry]["frames"]
-                split_dict = train_test_val(
-                    frames,
-                    training_fraction=training_fraction,
-                    validation_fraction=validation_fraction,
-                    random_seed=random_seed,
-                    verbose=verbose,
+            entries = [
+                e for e in labels if e not in ("video", "video_file_path")
+            ]
+            if not entries:
+                continue
+            # One split decision per frame over the union of every label's
+            # frames, so a frame shared by multiple labels always lands in
+            # the same split. A per-label split would otherwise send the
+            # same frame to train for one class and val for another,
+            # duplicating the image across split folders on export.
+            all_frames = np.unique(
+                np.concatenate(
+                    [np.asarray(labels[e]["frames"]) for e in entries]
                 )
+            )
+            union_split = train_test_val(
+                all_frames,
+                training_fraction=training_fraction,
+                validation_fraction=validation_fraction,
+                random_seed=random_seed,
+                buffer=buffer,
+                verbose=verbose,
+            )
+            frame_to_split = {}
+            for split_name in ("train", "val", "test"):
+                for f in union_split[split_name]:
+                    frame_to_split[int(f)] = split_name
 
-                labels[entry]["frames_split"] = split_dict
+            # Derive each label's split by filtering the global assignment
+            # to that label's frames. Buffered frames (dropped at block
+            # boundaries) map to nothing and are excluded everywhere.
+            for entry in entries:
+                buckets = {"train": [], "val": [], "test": []}
+                for f in labels[entry]["frames"]:
+                    split_name = frame_to_split.get(int(f))
+                    if split_name is not None:
+                        buckets[split_name].append(int(f))
+                labels[entry]["frames_split"] = {
+                    k: np.array(v, dtype=all_frames.dtype)
+                    for k, v in buckets.items()
+                }
 
     def summarize_split(self):
         """Return structured train/val/test split report data.
