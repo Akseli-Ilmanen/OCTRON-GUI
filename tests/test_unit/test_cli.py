@@ -184,7 +184,10 @@ def test_config_path_reports_location(tmp_path):
         app, ["config", "path"], env={"OCTRON_CONFIG_PATH": str(cfg)}
     )
     assert result.exit_code == 0
-    assert str(cfg) in result.output
+    # The CLI prints paths via Path.as_posix() (forward slashes on every
+    # OS), so compare against that rather than str(cfg), which uses
+    # backslashes on Windows.
+    assert cfg.as_posix() in result.output
     assert "not created yet" in result.output
 
 
