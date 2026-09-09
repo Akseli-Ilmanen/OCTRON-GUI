@@ -2338,6 +2338,19 @@ def octron_gui():
 
     setup_logging()
 
+    # Create a commented config.yaml template on first launch so the
+    # settings are discoverable and editable. No-op if the file already
+    # exists; the template is inert (all comments) until a line is
+    # uncommented, so it never overrides a built-in default.
+    from octron import config
+
+    try:
+        _written = config.write_template()
+        if _written is not None:
+            logger.info(f"Created config template at {_written.as_posix()}")
+    except Exception as e:  # never let config priming block startup
+        logger.debug(f"Could not create config template: {e}")
+
     # Give OCTRON its own Windows taskbar identity, then (on Windows)
     # create the QApplication ourselves *before* napari does.
     _set_windows_app_id()

@@ -40,6 +40,7 @@ Example ``config.yaml``::
 """
 
 import os
+import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,6 +120,26 @@ def _coerce_nonneg_int(value):
     return number
 
 
+def _coerce_positive_int(value):
+    """Coerce a value to a positive integer (>= 1)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("expected an integer") from e
+    if number < 1:
+        raise ValueError("must be >= 1")
+    return number
+
+
+def _coerce_device(value):
+    """Coerce a compute-device setting to one of auto/cpu/cuda/mps."""
+    text = str(value).strip().lower()
+    allowed = ("auto", "cpu", "cuda", "mps")
+    if text not in allowed:
+        raise ValueError(f"must be one of {', '.join(allowed)}")
+    return text
+
+
 # The settings schema.  Add new user settings here; everything else (loading,
 # validation, the CLI, and a settings dialog) picks them up automatically.
 SETTINGS: "tuple[SettingSpec, ...]" = (
@@ -188,6 +209,30 @@ SETTINGS: "tuple[SettingSpec, ...]" = (
             "is omitted, and by the GUI."
         ),
         coerce=_coerce_nonneg_int,
+    ),
+    SettingSpec(
+        key="device",
+        default="auto",
+        kind="choice",
+        choices=("auto", "cpu", "cuda", "mps"),
+        description=(
+            "Compute device for training and prediction: 'auto' picks "
+            "CUDA, then MPS, then CPU. Set 'cpu'/'cuda'/'mps' to force "
+            "one. The GUI has no device selector, so this is the only "
+            "way to override auto-detection there."
+        ),
+        coerce=_coerce_device,
+    ),
+    SettingSpec(
+        key="prediction_buffer_size",
+        default=500,
+        kind="int",
+        description=(
+            "Frames buffered before writing prediction output to zarr. "
+            "Lower it to reduce memory use on constrained machines. Used "
+            "when --buffer-size is omitted, and by the GUI."
+        ),
+        coerce=_coerce_positive_int,
     ),
 )
 
@@ -290,6 +335,15 @@ def specs() -> "tuple[SettingSpec, ...]":
     return SETTINGS
 
 
+def user_keys() -> set:
+    """Return known setting keys explicitly stored in ``config.yaml``.
+
+    Keys absent from the file (served from their in-code default) are not
+    included. Used by ``octron config list`` to show each value's source.
+    """
+    return {key for key in _read_raw() if key in _SPECS}
+
+
 # ---------------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------------
@@ -313,6 +367,58 @@ def set_value(key: str, value) -> Path:
     with open(path, "w") as f:
         f.write("# OCTRON user configuration\n")
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+    return path
+
+
+def _yaml_scalar(value) -> str:
+    """Render a default as a simple YAML scalar for the config template."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def render_template() -> str:
+    """Return a fully commented ``config.yaml`` template.
+
+    Every setting is emitted as commented-out lines (its description,
+    allowed choices where relevant, and its built-in default), so the
+    file documents the available settings and is ready to edit. It is
+    inert: an untouched template reads as an empty mapping, so all
+    built-in defaults still apply until a line is uncommented.
+    """
+    lines = [
+        "# OCTRON user configuration",
+        "#",
+        "# Uncomment and edit a line below to override the built-in default.",
+        "# Delete this file to fall back to all built-in defaults.",
+        "",
+    ]
+    for spec in SETTINGS:
+        for wrapped in textwrap.wrap(spec.description, width=74):
+            lines.append(f"# {wrapped}")
+        if spec.choices:
+            lines.append(
+                f"#   choices: {', '.join(str(c) for c in spec.choices)}"
+            )
+        lines.append(f"# {spec.key}: {_yaml_scalar(spec.default)}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def write_template(force: bool = False) -> Path | None:
+    """Write the commented template (see :func:`render_template`) to disk.
+
+    Writes to :func:`config_path`. Returns the written path, or None when
+    the file already exists and ``force`` is False (nothing is
+    overwritten). Parent directories are created as needed.
+    """
+    path = config_path()
+    if path.exists() and not force:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_template())
     return path
 
 
@@ -411,3 +517,13 @@ def get_split_seed() -> int:
 def get_split_buffer() -> int:
     """Return the buffer (frames dropped at split block boundaries)."""
     return get_value("split_buffer")
+
+
+def get_device() -> str:
+    """Return the configured compute device ('auto'/'cpu'/'cuda'/'mps')."""
+    return get_value("device")
+
+
+def get_prediction_buffer_size() -> int:
+    """Return the zarr write buffer size (frames) used during prediction."""
+    return get_value("prediction_buffer_size")

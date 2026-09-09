@@ -224,3 +224,88 @@ def test_specs_includes_split_settings(cfg_path):
         "split_seed",
         "split_buffer",
     } <= keys
+
+
+# ---------------------------------------------------------------------------
+# Device + prediction buffer size
+# ---------------------------------------------------------------------------
+
+
+def test_device_default_and_roundtrip(cfg_path):
+    assert config.get_device() == "auto"
+    config.set_value("device", "cpu")
+    assert config.get_device() == "cpu"
+
+
+def test_device_normalizes_case(cfg_path):
+    config.set_value("device", "CUDA")
+    assert config.get_device() == "cuda"
+
+
+def test_device_rejects_unknown(cfg_path):
+    with pytest.raises(ValueError):
+        config.set_value("device", "gpu")
+
+
+def test_prediction_buffer_size_default_and_roundtrip(cfg_path):
+    assert config.get_prediction_buffer_size() == 500
+    config.set_value("prediction_buffer_size", 250)
+    assert config.get_prediction_buffer_size() == 250
+
+
+def test_prediction_buffer_size_rejects_non_positive(cfg_path):
+    with pytest.raises(ValueError):
+        config.set_value("prediction_buffer_size", 0)
+
+
+def test_specs_includes_device_and_buffer(cfg_path):
+    keys = {s.key for s in config.specs()}
+    assert {"device", "prediction_buffer_size"} <= keys
+
+
+def test_user_keys_reports_only_file_keys(cfg_path):
+    # user_keys() reflects only what's stored in config.yaml, not defaults.
+    assert config.user_keys() == set()
+    config.set_value("split_seed", 7)
+    assert config.user_keys() == {"split_seed"}
+
+
+# ---------------------------------------------------------------------------
+# config.yaml template (octron config init / GUI first-launch priming)
+# ---------------------------------------------------------------------------
+
+
+def test_render_template_documents_all_settings(cfg_path):
+    text = config.render_template()
+    for spec in config.specs():
+        # Each setting appears as a commented-out key line.
+        assert f"# {spec.key}:" in text
+
+
+def test_template_is_inert(cfg_path):
+    # A freshly written template overrides nothing: reading it yields the
+    # built-in defaults and reports no user-set keys.
+    cfg_path.write_text(config.render_template())
+    assert config.user_keys() == set()
+    assert config.load() == {s.key: s.default for s in config.specs()}
+
+
+def test_write_template_creates_when_absent(cfg_path):
+    assert not cfg_path.exists()
+    written = config.write_template()
+    assert written == cfg_path
+    assert cfg_path.exists()
+
+
+def test_write_template_skips_existing_without_force(cfg_path):
+    config.set_value("split_seed", 7)  # creates the file with an override
+    assert config.write_template() is None
+    assert config.get_split_seed() == 7  # untouched
+
+
+def test_write_template_force_overwrites(cfg_path):
+    config.set_value("split_seed", 7)
+    written = config.write_template(force=True)
+    assert written == cfg_path
+    # Overwritten with the inert template -> back to the default.
+    assert config.get_split_seed() == 88

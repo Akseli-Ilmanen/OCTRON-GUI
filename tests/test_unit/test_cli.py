@@ -7,6 +7,7 @@ Covered subcommands and flags
 ------------------------------
 gui         --help
 gpu-test    --help; gpu-test runs (skipped if torch DLLs unavailable)
+config      --help + list/get/set/path (get/set/path use OCTRON_CONFIG_PATH)
 split       --help: --mode, --train, --val, --seed, --buffer, --prune,
                     --watershed, --dry-run
 train       --help: --model, --mode, --device, --epochs, --imagesz,
@@ -162,6 +163,106 @@ def test_train_help():
     assert "--no-prune" in out
     assert "--watershed" in out
     assert "--no-watershed" in out
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+
+def test_config_help():
+    result = runner.invoke(app, ["config", "--help"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    for sub in ("init", "list", "get", "set", "path", "edit"):
+        assert sub in out
+
+
+def test_config_init_creates_and_respects_force(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env = {"OCTRON_CONFIG_PATH": str(cfg)}
+    assert runner.invoke(app, ["config", "init"], env=env).exit_code == 0
+    assert cfg.exists()
+    # The template is inert: split_seed still reports the default.
+    assert (
+        "88"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
+    # A user override survives a plain re-init (no overwrite)...
+    runner.invoke(app, ["config", "set", "split_seed", "7"], env=env)
+    assert runner.invoke(app, ["config", "init"], env=env).exit_code == 0
+    assert (
+        "7"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
+    # ...but --force overwrites back to the template (default again).
+    assert (
+        runner.invoke(app, ["config", "init", "--force"], env=env).exit_code
+        == 0
+    )
+    assert (
+        "88"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
+
+
+def test_config_path_reports_location(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app, ["config", "path"], env={"OCTRON_CONFIG_PATH": str(cfg)}
+    )
+    assert result.exit_code == 0
+    # The CLI prints paths via Path.as_posix() (forward slashes on every
+    # OS), so compare against that rather than str(cfg), which uses
+    # backslashes on Windows.
+    assert cfg.as_posix() in result.output
+    assert "not created yet" in result.output
+
+
+def test_config_set_and_get_roundtrip(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env = {"OCTRON_CONFIG_PATH": str(cfg)}
+    set_result = runner.invoke(
+        app, ["config", "set", "split_seed", "4242"], env=env
+    )
+    assert set_result.exit_code == 0
+    assert cfg.exists()
+    get_result = runner.invoke(app, ["config", "get", "split_seed"], env=env)
+    assert get_result.exit_code == 0
+    assert "4242" in get_result.output
+
+
+def test_config_get_unknown_key_errors(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app,
+        ["config", "get", "not_a_key"],
+        env={"OCTRON_CONFIG_PATH": str(cfg)},
+    )
+    assert result.exit_code != 0
+    assert "unknown setting" in _plain(result.output).lower()
+
+
+def test_config_set_invalid_value_errors(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app,
+        ["config", "set", "split_val_fraction", "1.5"],
+        env={"OCTRON_CONFIG_PATH": str(cfg)},
+    )
+    assert result.exit_code != 0
+
+
+def test_config_list_shows_settings_and_source(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app, ["config", "list"], env={"OCTRON_CONFIG_PATH": str(cfg)}
+    )
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "split_seed" in out
+    assert "prediction_cache_dir" in out
+    assert "source: default" in out
 
 
 # ---------------------------------------------------------------------------

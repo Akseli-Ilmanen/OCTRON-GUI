@@ -4,7 +4,6 @@ import shutil
 import time
 from pathlib import Path
 
-import torch
 import yaml
 from loguru import logger
 from napari.qt import create_worker
@@ -47,15 +46,16 @@ class YoloHandler(QObject):
         self.w = parent_widget  # main.py -> octron_widget
         self.yolo = yolo_octron
 
-        # Device label?
-        if torch.cuda.is_available():
-            self.device_label = "cuda"  # torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device_label = "mps"  # "mps" # torch.device("mps")
-            # print(f'MPS is available, but not yet supported.
-            # Using CPU instead.')
-        else:
-            self.device_label = "cpu"  # torch.device("cpu")
+        # Device: use the configured device from config.yaml ('device').
+        # 'auto' auto-detects cuda -> mps -> cpu. This is the only way a
+        # GUI user can override the device, since there is no device widget.
+        from octron import config
+        from octron.test_gpu import auto_device
+
+        configured_device = config.get_device()
+        self.device_label = (
+            auto_device() if configured_device == "auto" else configured_device
+        )
         logger.info(f'Using YOLO device: "{self.device_label}"')
 
         # Set up variables
@@ -1345,6 +1345,8 @@ class YoloHandler(QObject):
 
         # Call the prediction function which yields progress info
         # self.videos_to_predict is a dict: {video_name: video_metadata_dict}
+        from octron import config
+
         yield from self.yolo.predict_batch(
             videos=self.videos_to_predict,
             model_path=self.model_predict_path,
@@ -1357,6 +1359,7 @@ class YoloHandler(QObject):
             conf_thresh=self.conf_thresh,
             opening_radius=self.mask_opening,
             overwrite=self.overwrite_predictions,
+            buffer_size=config.get_prediction_buffer_size(),
         )
 
     def _update_prediction_progress(self, progress_info):

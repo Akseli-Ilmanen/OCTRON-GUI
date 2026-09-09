@@ -21,14 +21,14 @@ def run_predict(
     tracker_name=None,
     tracker_cfg_path=None,
     tracker_params=None,
-    device="auto",
+    device=None,
     conf_thresh=0.5,
     iou_thresh=0.7,
     skip_frames=0,
     one_object_per_label=False,
     opening_radius=0,
     overwrite=False,
-    buffer_size=500,
+    buffer_size=None,
     region_properties=None,
     output_dir=None,
     debug=False,
@@ -50,9 +50,10 @@ def run_predict(
         ``tracker_name``).
     tracker_params : dict, optional
         Parameter overrides applied on top of the resolved tracker config.
-    device : str
-        Device to run inference on ('auto', 'cpu', 'cuda', 'mps'). 'auto'
-        selects CUDA if available, then MPS, then CPU.
+    device : str or None
+        Device to run inference on ('auto', 'cpu', 'cuda', 'mps'). None
+        reads ``device`` from ``config.yaml`` (default 'auto' selects CUDA
+        if available, then MPS, then CPU).
     conf_thresh : float
         Confidence threshold for detection.
     iou_thresh : float
@@ -65,8 +66,9 @@ def run_predict(
         Morphological opening radius applied to masks to remove noise.
     overwrite : bool
         Overwrite existing prediction results.
-    buffer_size : int
-        Number of frames buffered before writing to zarr.
+    buffer_size : int or None
+        Number of frames buffered before writing to zarr. None reads
+        ``prediction_buffer_size`` from ``config.yaml``.
     region_properties : tuple or None
         Region property names to extract via skimage.measure.regionprops_table.
         Pass DEFAULT_REGION_PROPERTIES for the standard set, or None to skip.
@@ -117,11 +119,20 @@ def run_predict(
 
     from loguru import logger
 
+    from octron import config
     from octron.test_gpu import auto_device
     from octron.yolo_octron.yolo_octron import YOLO_octron
 
     # Silence boxmot's verbose INFO chatter (tracker init parameter dumps).
     logger.disable("boxmot")
+
+    # Resolve device/buffer_size from config.yaml when not set explicitly
+    # (the CLI passes None). Precedence: explicit arg > config.yaml >
+    # built-in default.
+    if device is None:
+        device = config.get_device()
+    if buffer_size is None:
+        buffer_size = config.get_prediction_buffer_size()
 
     # Unwrap a Device enum to its plain string value (mirrors run_training).
     # boxmot's select_device() calls str(device).lower(); a (str, Enum)

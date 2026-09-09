@@ -6,6 +6,8 @@ Subcommands
 -----------
   gui         Launch the OCTRON napari GUI
   gpu-test    Check GPU availability
+  config      View/edit config.yaml settings
+              (init/list/get/set/path/edit)
   split       Prepare and export train/val/test data from an OCTRON project
   train       Prepare training data and run YOLO model training
   predict     Run YOLO prediction and tracking on one or more videos
@@ -332,7 +334,9 @@ def train(
     train_mode: TrainMode = typer.Option(
         TrainMode.segment, "--mode", help="Training mode."
     ),
-    device: Device = typer.Option(Device.auto, help="Device to train on."),
+    device: Device | None = typer.Option(
+        None, help="Device to train on (default: config.yaml)."
+    ),
     epochs: int = typer.Option(250, help="Number of training epochs."),
     imagesz: int = typer.Option(640, help="Input image size."),
     save_period: int = typer.Option(
@@ -448,8 +452,8 @@ def predict(
         "--tracker-config",
         help="Path to a custom tracker config YAML (overrides --tracker).",
     ),
-    device: Device = typer.Option(
-        Device.auto, help="Device to run inference on."
+    device: Device | None = typer.Option(
+        None, help="Device to run inference on (default: config.yaml)."
     ),
     conf_thresh: float = typer.Option(
         0.5, help="Confidence threshold for detection."
@@ -475,8 +479,9 @@ def predict(
     detailed: str | None = typer.Option(
         None, "--detailed", help=_DETAILED_HELP
     ),
-    buffer_size: int = typer.Option(
-        500, help="Frame buffer size before writing to zarr."
+    buffer_size: int | None = typer.Option(
+        None,
+        help="Frames buffered before writing to zarr (default: config.yaml).",
     ),
     output_dir: Path | None = typer.Option(
         None,
@@ -1043,6 +1048,140 @@ def download_sam3(
         f"SAM checkpoints are in: "
         f"{config.get_sam_checkpoints_dir().as_posix()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# config: view and edit config.yaml settings
+# ---------------------------------------------------------------------------
+
+config_app = typer.Typer(
+    name="config",
+    help="View and edit OCTRON settings stored in config.yaml.",
+    no_args_is_help=True,
+)
+app.add_typer(config_app, name="config")
+
+
+def _fmt_setting(value) -> str:
+    """Format a setting value for display (``None``/'' -> ``(unset)``)."""
+    return "(unset)" if value is None or value == "" else str(value)
+
+
+@config_app.command("init")
+def config_init(
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing config.yaml."
+    ),
+):
+    """Write a commented config.yaml template (all settings + defaults).
+
+    The template is fully commented, so it documents every setting
+    without changing any built-in default until you uncomment a line.
+    """
+    from octron import config
+
+    path = config.write_template(force=force)
+    if path is None:
+        existing = config.config_path().as_posix()
+        logger.info(
+            f"config.yaml already exists at {existing}; "
+            f"use --force to overwrite."
+        )
+        return
+    logger.info(f"Wrote config template to {path.as_posix()}")
+
+
+@config_app.command("list")
+def config_list():
+    """List every setting with its value, default, source and help."""
+    import textwrap
+
+    from octron import config
+
+    effective = config.load()
+    from_file = config.user_keys()
+    path = config.config_path()
+    suffix = "" if path.exists() else "  (not created yet)"
+    typer.echo(f"config.yaml: {path.as_posix()}{suffix}")
+    typer.echo("")
+    for spec in config.specs():
+        source = "config.yaml" if spec.key in from_file else "default"
+        typer.echo(
+            f"{spec.key} = {_fmt_setting(effective[spec.key])}"
+            f"   [default: {_fmt_setting(spec.default)}, source: {source}]"
+        )
+        for line in textwrap.wrap(spec.description, width=72):
+            typer.echo(f"    {line}")
+        typer.echo("")
+
+
+@config_app.command("get")
+def config_get(
+    key: str = typer.Argument(
+        ..., help="Setting name (see 'octron config list')."
+    ),
+):
+    """Print the effective value of KEY to stdout (only the value).
+
+    Handy in scripts, e.g. ``SEED=$(octron config get split_seed)``.
+    """
+    from octron import config
+
+    try:
+        value = config.get_value(key)
+    except KeyError as e:
+        raise typer.BadParameter(
+            f"unknown setting {key!r}; see 'octron config list'.",
+            param_hint="KEY",
+        ) from e
+    typer.echo("" if value is None else str(value))
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(
+        ..., help="Setting name (see 'octron config list')."
+    ),
+    value: str = typer.Argument(
+        ..., help="New value; use '' to clear a directory setting."
+    ),
+):
+    """Validate VALUE and save it to config.yaml (creating it if needed)."""
+    from octron import config
+
+    try:
+        path = config.set_value(key, value)
+    except KeyError as e:
+        raise typer.BadParameter(
+            f"unknown setting {key!r}; see 'octron config list'.",
+            param_hint="KEY",
+        ) from e
+    except (ValueError, TypeError) as e:
+        raise typer.BadParameter(str(e), param_hint="VALUE") from e
+    logger.info(f"Set {key} = {config.get_value(key)!r} in {path.as_posix()}")
+
+
+@config_app.command("path")
+def config_show_path():
+    """Print the config.yaml location and whether it exists yet."""
+    from octron import config
+
+    path = config.config_path()
+    state = "exists" if path.exists() else "not created yet"
+    typer.echo(f"{path.as_posix()} ({state})")
+
+
+@config_app.command("edit")
+def config_edit():
+    """Open config.yaml in your $EDITOR (creating it if missing)."""
+    import click
+
+    from octron import config
+
+    path = config.config_path()
+    if not path.exists():
+        config.write_template()
+    click.edit(filename=str(path))
 
 
 def main():
