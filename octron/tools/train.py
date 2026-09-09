@@ -16,7 +16,7 @@ def run_training(
     project_path,
     model="YOLO26m",
     train_mode="segment",
-    device="auto",
+    device=None,
     epochs=250,
     imagesz=640,
     save_period=50,
@@ -41,9 +41,10 @@ def run_training(
         Path to the OCTRON project directory.
     model : str or Path
         YOLO model name (e.g. 'YOLO11m') or path to an existing model file.
-    device : str
-        Device to train on ('auto', 'cpu', 'cuda', 'mps'). 'auto' selects
-        CUDA if available, then MPS, then CPU.
+    device : str or None
+        Device to train on ('auto', 'cpu', 'cuda', 'mps'). None reads
+        ``device`` from ``config.yaml`` (default 'auto' selects CUDA if
+        available, then MPS, then CPU).
     epochs : int
         Number of training epochs.
     imagesz : int
@@ -62,16 +63,16 @@ def run_training(
         Skip data preparation. Use when ``octron split`` has already been run
         and the training data is up to date.
     train_fraction : float or None
-        Fraction of frames for training. ``None`` reads ``config.yaml``
+        Fraction of frames for training. None reads ``config.yaml``
         (ignored when ``skip_split=True``).
     val_fraction : float or None
-        Fraction of frames for validation. ``None`` reads ``config.yaml``
+        Fraction of frames for validation. None reads ``config.yaml``
         (ignored when ``skip_split=True``).
     seed : int or None
-        Random seed for the split. ``None`` reads ``config.yaml``
+        Random seed for the split. None reads ``config.yaml``
         (ignored when ``skip_split=True``).
     buffer : int or None
-        Frames dropped at each train/val/test block boundary. ``None``
+        Frames dropped at each train/val/test block boundary. None
         reads ``config.yaml`` (ignored when ``skip_split=True``).
     prune : bool
         Drop frames where not all labels are annotated (ignored when
@@ -81,6 +82,7 @@ def run_training(
         (ignored when ``skip_split=True``). Default ``False``.
 
     """
+    from octron import config
     from octron.test_gpu import auto_device
     from octron.tools.split import run_split
     from octron.yolo_octron.yolo_octron import YOLO_octron
@@ -90,6 +92,10 @@ def run_training(
     train_mode = (
         train_mode.value if hasattr(train_mode, "value") else str(train_mode)
     )
+    # Resolve device from config.yaml when not set explicitly (the CLI
+    # passes None). Precedence: explicit arg > config.yaml > 'auto'.
+    if device is None:
+        device = config.get_device()
     device = device.value if hasattr(device, "value") else str(device)
 
     if device == "auto":

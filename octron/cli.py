@@ -333,7 +333,9 @@ def train(
     train_mode: TrainMode = typer.Option(
         TrainMode.segment, "--mode", help="Training mode."
     ),
-    device: Device = typer.Option(Device.auto, help="Device to train on."),
+    device: Device | None = typer.Option(
+        None, help="Device to train on (default: config.yaml)."
+    ),
     epochs: int = typer.Option(250, help="Number of training epochs."),
     imagesz: int = typer.Option(640, help="Input image size."),
     save_period: int = typer.Option(
@@ -449,8 +451,8 @@ def predict(
         "--tracker-config",
         help="Path to a custom tracker config YAML (overrides --tracker).",
     ),
-    device: Device = typer.Option(
-        Device.auto, help="Device to run inference on."
+    device: Device | None = typer.Option(
+        None, help="Device to run inference on (default: config.yaml)."
     ),
     conf_thresh: float = typer.Option(
         0.5, help="Confidence threshold for detection."
@@ -476,8 +478,9 @@ def predict(
     detailed: str | None = typer.Option(
         None, "--detailed", help=_DETAILED_HELP
     ),
-    buffer_size: int = typer.Option(
-        500, help="Frame buffer size before writing to zarr."
+    buffer_size: int | None = typer.Option(
+        None,
+        help="Frames buffered before writing to zarr (default: config.yaml).",
     ),
     output_dir: Path | None = typer.Option(
         None,

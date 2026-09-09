@@ -119,6 +119,26 @@ def _coerce_nonneg_int(value):
     return number
 
 
+def _coerce_positive_int(value):
+    """Coerce a value to a positive integer (>= 1)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("expected an integer") from e
+    if number < 1:
+        raise ValueError("must be >= 1")
+    return number
+
+
+def _coerce_device(value):
+    """Coerce a compute-device setting to one of auto/cpu/cuda/mps."""
+    text = str(value).strip().lower()
+    allowed = ("auto", "cpu", "cuda", "mps")
+    if text not in allowed:
+        raise ValueError(f"must be one of {', '.join(allowed)}")
+    return text
+
+
 # The settings schema.  Add new user settings here; everything else (loading,
 # validation, the CLI, and a settings dialog) picks them up automatically.
 SETTINGS: "tuple[SettingSpec, ...]" = (
@@ -188,6 +208,30 @@ SETTINGS: "tuple[SettingSpec, ...]" = (
             "is omitted, and by the GUI."
         ),
         coerce=_coerce_nonneg_int,
+    ),
+    SettingSpec(
+        key="device",
+        default="auto",
+        kind="choice",
+        choices=("auto", "cpu", "cuda", "mps"),
+        description=(
+            "Compute device for training and prediction: 'auto' picks "
+            "CUDA, then MPS, then CPU. Set 'cpu'/'cuda'/'mps' to force "
+            "one. The GUI has no device selector, so this is the only "
+            "way to override auto-detection there."
+        ),
+        coerce=_coerce_device,
+    ),
+    SettingSpec(
+        key="prediction_buffer_size",
+        default=500,
+        kind="int",
+        description=(
+            "Frames buffered before writing prediction output to zarr. "
+            "Lower it to reduce memory use on constrained machines. Used "
+            "when --buffer-size is omitted, and by the GUI."
+        ),
+        coerce=_coerce_positive_int,
     ),
 )
 
@@ -420,3 +464,13 @@ def get_split_seed() -> int:
 def get_split_buffer() -> int:
     """Return the buffer (frames dropped at split block boundaries)."""
     return get_value("split_buffer")
+
+
+def get_device() -> str:
+    """Return the configured compute device ('auto'/'cpu'/'cuda'/'mps')."""
+    return get_value("device")
+
+
+def get_prediction_buffer_size() -> int:
+    """Return the zarr write buffer size (frames) used during prediction."""
+    return get_value("prediction_buffer_size")

@@ -37,18 +37,18 @@ def run_split(
     project_path : str or Path
         Path to the OCTRON project directory.
     train_fraction : float or None
-        Fraction of frames for the training split. ``None`` (the CLI
+        Fraction of frames for the training split. None (the CLI
         default) reads ``split_train_fraction`` from ``config.yaml``.
     val_fraction : float or None
         Fraction of frames for the validation split; the remainder
-        becomes the test split. ``None`` reads ``split_val_fraction``
+        becomes the test split. None reads ``split_val_fraction``
         from config.
     seed : int or None
-        Random seed for reproducibility. ``None`` reads ``split_seed``
+        Random seed for reproducibility. None reads ``split_seed``
         from config.
     buffer : int or None
         Frames dropped at each train/val/test block boundary to add a
-        temporal gap between splits. ``None`` (the CLI default) reads
+        temporal gap between splits. None (the CLI default) reads
         ``split_buffer`` from ``config.yaml``.
     prune : bool
         Drop frames where not all labels are annotated (threaded to
