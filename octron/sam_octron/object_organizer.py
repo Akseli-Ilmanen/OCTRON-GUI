@@ -233,27 +233,49 @@ class ObjectOrganizer(BaseModel):
 
         # Find out which color to assign (if necessary)
         if entry.color is None:
+            entry.color = self.pick_color(entry)
+
+        self.entries[id_] = entry
+        return True
+
+    def pick_color(self, entry: Obj) -> list:
+        """Choose a colour for a new entry.
+
+        Two strategies, selected by the ``object_color_mode`` user
+        setting (see ``octron.config``):
+
+        * ``label`` (default): each label owns a slice of the colormap
+          and every suffix of that label is a shade within the slice.
+        * ``individual``: every (label, suffix) pair takes the next
+          maximally different slice, so individuals of one species are
+          as distinguishable as different species.
+        """
+        from octron import config
+
+        (
+            label_colors,
+            indices_max_diff_labels,
+            indices_max_diff_subcolors,
+        ) = self.all_colors()
+        if config.get_object_color_mode() == "individual":
+            n_existing = len(self.entries)
+            colors_index = indices_max_diff_labels[
+                n_existing % self.n_labels_max
+            ]
+            subcolors_index = indices_max_diff_subcolors[
+                (n_existing // self.n_labels_max) % self.n_subcolors
+            ]
+        else:
             n_subcolors = len(
                 self.get_suffixes_by_label(entry.label)
             )  # These colors already exist ...
-            (
-                label_colors,
-                indices_max_diff_labels,
-                indices_max_diff_subcolors,
-            ) = self.all_colors()
-
             colors_index = indices_max_diff_labels[
                 entry.label_id % self.n_labels_max
             ]
             subcolors_index = indices_max_diff_subcolors[
                 n_subcolors % self.n_subcolors
             ]
-
-            this_color = label_colors[colors_index][subcolors_index]
-            entry.color = this_color
-
-        self.entries[id_] = entry
-        return True
+        return label_colors[colors_index][subcolors_index]
 
     def update_entry(self, id_: int, entry: Obj) -> None:
         """Replace the entry for the given ID, checking for clashes."""

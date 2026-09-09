@@ -9,6 +9,8 @@ OCTRON is built on [Napari](https://www.napari.org), [Segment Anything (SAM2/SAM
 ### Documentation
 All documentation can be found under [OCTRON-docs on github pages](https://octron-tracking.github.io/OCTRON-docs/).
 
+Multi-camera mosaics, identity classification and the tracklet exclusivity pass (`octron link`) are described in [MULTICAMERA.md](MULTICAMERA.md).
+
 ### Support
 
 If you find this project helpful, consider supporting us:

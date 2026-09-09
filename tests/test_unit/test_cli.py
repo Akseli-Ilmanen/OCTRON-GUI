@@ -17,6 +17,7 @@ predict     --help: --model, --tracker, --tracker-config, --device,
                     --conf-thresh, --iou-thresh, --skip-frames,
                     --one-object-per-label, --opening-radius, --overwrite,
                     --detailed, --buffer-size, --output-dir, --local-cache-dir
+link        --help: --min-margin, --global, --overwrite
 dump-tracker-config  TRACKER [-o PATH]: print/write a tracker's default config
 render      --help: --video, --output, --preset, --start, --end, --alpha,
                     --masks/--no-masks, --boxes/--no-boxes,
@@ -114,6 +115,105 @@ def test_gpu_test_runs():
         pytest.skip("torch DLLs could not be loaded in this environment")
     result = runner.invoke(app, ["gpu-test"])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# cameras
+# ---------------------------------------------------------------------------
+
+
+def test_cameras_help():
+    result = runner.invoke(app, ["cameras", "--help"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "--project" in out
+    assert "--video" in out
+    assert "--force" in out
+    assert "--show" in out
+
+
+def test_cameras_show_only_validates_and_prints_table(tmp_path):
+    from octron.cameras import CameraLayout
+
+    cameras_json = tmp_path / "cameras.json"
+    CameraLayout.full_frame(100, 50, name="cam0").save(cameras_json)
+
+    result = runner.invoke(app, ["cameras", str(cameras_json), "--show"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "cam0" in out
+    assert "100" in out
+    assert "50" in out
+
+
+def test_cameras_errors_without_project_or_video_or_show(tmp_path):
+    from octron.cameras import CameraLayout
+
+    cameras_json = tmp_path / "cameras.json"
+    CameraLayout.full_frame(100, 50).save(cameras_json)
+
+    result = runner.invoke(app, ["cameras", str(cameras_json)])
+    assert result.exit_code == 1
+
+
+def test_cameras_apply_roundtrip_project_and_video(tmp_path):
+    from octron.cameras import CameraLayout, sibling_cameras_path
+
+    cameras_json = tmp_path / "cameras.json"
+    CameraLayout.full_frame(100, 50, name="cam0").save(cameras_json)
+
+    project = tmp_path / "project"
+    sub = project / "abc12345"
+    sub.mkdir(parents=True)
+    (sub / "object_organizer.json").write_text("{}")
+
+    video = tmp_path / "run1.mp4"
+
+    result = runner.invoke(
+        app,
+        [
+            "cameras",
+            str(cameras_json),
+            "--project",
+            str(project),
+            "--video",
+            str(video),
+        ],
+    )
+    assert result.exit_code == 0
+    assert (sub / "cameras.json").exists()
+    assert sibling_cameras_path(video).exists()
+
+    # Re-running without --force skips the existing files.
+    result_again = runner.invoke(
+        app,
+        [
+            "cameras",
+            str(cameras_json),
+            "--project",
+            str(project),
+            "--video",
+            str(video),
+        ],
+    )
+    assert result_again.exit_code == 0
+    assert "No cameras.json files written" in result_again.output
+
+    # --force overwrites them again.
+    result_forced = runner.invoke(
+        app,
+        [
+            "cameras",
+            str(cameras_json),
+            "--project",
+            str(project),
+            "--video",
+            str(video),
+            "--force",
+        ],
+    )
+    assert result_forced.exit_code == 0
+    assert "Wrote cameras.json to:" in result_forced.output
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +427,20 @@ def test_predict_detailed_unknown_property_errors():
     )
     assert result.exit_code != 0
     assert "Unknown region property" in result.output
+
+
+# ---------------------------------------------------------------------------
+# link
+# ---------------------------------------------------------------------------
+
+
+def test_link_help():
+    result = runner.invoke(app, ["link", "--help"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "--min-margin" in out
+    assert "--global" in out
+    assert "--overwrite" in out
 
 
 # ---------------------------------------------------------------------------

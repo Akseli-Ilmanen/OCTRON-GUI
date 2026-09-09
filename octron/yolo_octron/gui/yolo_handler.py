@@ -1336,6 +1336,42 @@ class YoloHandler(QObject):
         self.w.train_finishtime_label.setText("↬ ... waiting for estimate")
         self.w.predict_finish_time_label.setEnabled(True)
 
+    def _camera_layouts_for_videos(self):
+        """Map videos to the project's saved ``cameras.json`` files.
+
+        Camera layouts drawn in the GUI are stored per video folder
+        (``<project>/<hash8>/cameras.json``) and record the video they
+        belong to. Videos without a match fall back to the core lookup
+        (sibling ``<stem>_cameras.json`` or the whole frame).
+
+        Returns
+        -------
+        dict or None
+            ``{video_name: Path}`` for videos with a saved layout.
+
+        """
+        from octron.cameras import CAMERAS_FILENAME, CameraLayout
+
+        project_path = self.w.project_path
+        if not project_path or not self.videos_to_predict:
+            return None
+        by_video_path = {}
+        for cameras_file in Path(project_path).glob(f"*/{CAMERAS_FILENAME}"):
+            try:
+                layout = CameraLayout.load(cameras_file)
+            except Exception as e:
+                logger.warning(f"Skipping {cameras_file}: {e}")
+                continue
+            if layout.video_file_path:
+                key = Path(layout.video_file_path).resolve()
+                by_video_path[key] = cameras_file
+        mapping = {}
+        for video_name, video_dict in self.videos_to_predict.items():
+            key = Path(video_dict["video_file_path"]).resolve()
+            if key in by_video_path:
+                mapping[video_name] = by_video_path[key]
+        return mapping or None
+
     def _yolo_predictor(self):
         if not self.device_label:
             show_error("No device label found for YOLO.")
@@ -1360,6 +1396,7 @@ class YoloHandler(QObject):
             opening_radius=self.mask_opening,
             overwrite=self.overwrite_predictions,
             buffer_size=config.get_prediction_buffer_size(),
+            cameras=self._camera_layouts_for_videos(),
         )
 
     def _update_prediction_progress(self, progress_info):

@@ -10,6 +10,7 @@ from napari.utils.notifications import (
     show_warning,
 )
 
+from octron.sam_octron.helpers.mosaic_predictor import MosaicPredictor
 from octron.sam_octron.helpers.octron_colors import (
     create_semantic_colormap,
 )
@@ -171,6 +172,11 @@ class sam_octron_callbacks:
                 # when new objects are added after tracking starts
                 # for the SAM2-HQ model. See comments in
                 # sam2hq_octron.add_new_mask / add_new_points_or_box
+                if isinstance(predictor, MosaicPredictor):
+                    # Keep the other cameras' masks of this object
+                    mask = predictor.merge_frame_mask(
+                        prediction_layer.data[frame_idx], mask
+                    )
                 prediction_layer.data[frame_idx] = mask
                 mark_frames_annotated(prediction_layer.data, frame_idx)
                 prediction_layer.refresh()
@@ -528,6 +534,11 @@ class sam_octron_callbacks:
                     # when new objects are added after tracking starts
                     # for the SAM2-HQ model. See comments in
                     # sam2hq_octron.add_new_mask / add_new_points_or_box
+                    if isinstance(predictor, MosaicPredictor):
+                        # Keep the other cameras' masks of this object
+                        mask = predictor.merge_frame_mask(
+                            prediction_layer.data[frame_idx, :, :], mask
+                        )
                     prediction_layer.data[frame_idx, :, :] = mask
                     mark_frames_annotated(prediction_layer.data, frame_idx)
                     # Enable batch predict buttons after first prediction

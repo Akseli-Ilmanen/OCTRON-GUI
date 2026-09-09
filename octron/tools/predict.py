@@ -33,6 +33,10 @@ def run_predict(
     output_dir=None,
     debug=False,
     local_cache_dir=None,
+    cameras=None,
+    identity_weights=None,
+    identity_imgsz=224,
+    identity_padding=0.1,
 ):
     """Run YOLO prediction and tracking on one or more videos.
 
@@ -83,6 +87,17 @@ def run_predict(
         ``predict_batch`` stages each video's output under
         ``<cache>/octron_cache_<pid>`` and moves the finished folder to
         ``output_dir``. Caching is OFF unless a cache dir is configured.
+    cameras : str or Path, optional
+        ``cameras.json`` describing the sub-camera rectangles of a mosaic
+        video. Applies to every video passed. When None, a sibling
+        ``<stem>_cameras.json`` next to each video is used if present.
+    identity_weights : str or Path, optional
+        Trained identity classifier (``octron train-identity``); adds
+        identity columns to the tracking CSVs.
+    identity_imgsz : int
+        Classifier input size.
+    identity_padding : float
+        Crop padding used for the classifier (match the dataset).
 
     """
     if isinstance(videos, (str, Path)):
@@ -187,6 +202,10 @@ def run_predict(
             region_properties=region_properties,
             output_dir=output_dir,
             local_cache_dir=local_cache_dir,
+            cameras=cameras,
+            identity_weights=identity_weights,
+            identity_imgsz=identity_imgsz,
+            identity_padding=identity_padding,
         ):
             stage = progress.get("stage", "")
 

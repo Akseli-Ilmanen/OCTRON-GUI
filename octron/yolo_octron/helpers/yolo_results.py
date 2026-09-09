@@ -479,6 +479,33 @@ class YOLO_results:
 
         return label
 
+    def get_identity_assignment(self):
+        """Load ``identity_assignment.csv`` written by ``octron link``.
+
+        Self-contained: reads directly from ``self.results_dir`` without
+        depending on any other loaded state (video, zarr, csvs).
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            Indexed by ``track_id``, with columns ``label, identity,
+            score, runner_up, runner_up_score, margin_ratio, n_frames,
+            first_frame, last_frame, flagged, reason``. ``None`` (with a
+            ``logger.info``) when the file does not exist, i.e.
+            ``octron link`` has not been run for this folder yet.
+
+        """
+        csv_path = self.results_dir / "identity_assignment.csv"
+        if not csv_path.exists():
+            if self.verbose:
+                logger.info(
+                    f"No identity_assignment.csv found in "
+                    f"'{self.results_dir.name}' (run `octron link` to "
+                    f"create it)."
+                )
+            return None
+        return pd.read_csv(csv_path, index_col="track_id")
+
     def define_colors(self, label_n=10, n_colors_submap=50):
         """Recreate the colors used for the masks.
 

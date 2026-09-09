@@ -41,6 +41,12 @@ import contextlib
 
 from loguru import logger
 
+from octron.cameras import (
+    CAMERAS_FILENAME,
+    load_layout_for_folder,
+    mask_within_camera,
+    resolve_layout,
+)
 from octron.sam_octron.helpers.sam_zarr import mark_frames_annotated
 from octron.tracking.helpers.tracker_checks import (
     load_boxmot_tracker_config,
@@ -74,6 +80,93 @@ MIN_SIZE_RATIO_OBJECT_FRAME = (
 MIN_SIZE_RATIO_OBJECT_MAX = (
     0.01  # Minimum size ratio of an object to the largest object in the frame
 )
+
+
+class _CameraTrackingState:
+    """Mutable per-camera state of one ``predict_batch`` video run.
+
+    Each camera of a mosaic layout gets its own BoxMOT tracker, mask
+    store, tracking dataframes and track-ID bookkeeping, so tracks never
+    cross camera borders. A video without a camera layout is a single
+    full-frame camera.
+    """
+
+    def __init__(
+        self, camera, save_dir, video_dict, tracker, prediction_store
+    ):
+        """Create the empty state for one camera."""
+        self.camera = camera
+        self.save_dir = Path(save_dir)
+        self.video_dict = video_dict
+        self.tracker = tracker
+        self.prediction_store = prediction_store
+        self.tracking_df_dict = {}
+        self.track_id_label_dict = {}
+        # Standard (multi-object) tracking maps each (boxmot track ID,
+        # label) pair to a stable OCTRON track ID so a boxmot ID that
+        # is matched to different classes over time is split into
+        # separate, label-consistent tracklets instead of raising.
+        self.split_track_ids = {}
+        self.next_split_track_id = 1
+        self.all_ids = []
+        self.mask_buffers = {}  # track_id -> {frame_idx: mask}
+        self.buffer_counts = {}  # track_id -> count
+        self.mask_stores = {}  # track_id -> zarr array
+
+    def flush_mask_buffer(self, track_id):
+        """Write a track's buffered masks to its zarr array."""
+        if track_id not in self.buffer_counts or (
+            self.buffer_counts[track_id] == 0
+        ):
+            return
+        mask_buffer = self.mask_buffers[track_id]
+        mask_store = self.mask_stores[track_id]
+        frame_indices = sorted(mask_buffer.keys())
+        stacked_masks = np.stack([mask_buffer[i] for i in frame_indices])
+        mask_store[frame_indices, :, :] = stacked_masks
+        mark_frames_annotated(mask_store, frame_indices)
+        self.mask_buffers[track_id].clear()
+        self.buffer_counts[track_id] = 0
+        logger.debug(
+            f"Saved mask buffer for track {track_id} to zarr "
+            f"({len(frame_indices)} frames)"
+        )
+
+    def save_tracking_csvs(self):
+        """Write one ``<label>_track_<id>.csv`` per track with a header."""
+        for track_id, tr_df in self.tracking_df_dict.items():
+            label = tr_df.attrs["label"]
+            df_to_save = tr_df.copy()
+            # Add the label column (will be filled with the same
+            # value for all rows)
+            df_to_save.insert(0, "label", label)
+            csv_path = self.save_dir / f"{label}_track_{track_id}.csv"
+            header = [
+                f"video_name: {tr_df.attrs.get('video_name', 'unknown')}",
+                f"frame_count: {tr_df.attrs.get('frame_count', '')}",
+                f"frame_count_analyzed: "
+                f"{tr_df.attrs.get('frame_count_analyzed', '')}",
+                f"video_height: {tr_df.attrs.get('video_height', '')}",
+                f"video_width: {tr_df.attrs.get('video_width', '')}",
+                f"created_at: "
+                f"{tr_df.attrs.get('created_at', str(datetime.now()))}",
+                "",  # Empty line for separation
+            ]
+            with open(csv_path, "w") as f:
+                f.write("\n".join(header) + "\n")
+                df_to_save.to_csv(f, na_rep="NaN", lineterminator="\n")
+            logger.debug(
+                f"Saved tracking data for '{label}' "
+                f"(track ID: {track_id}) to {csv_path.name}"
+            )
+
+    def close(self):
+        """Close the zarr store and drop references to its arrays."""
+        if self.prediction_store is not None:
+            with contextlib.suppress(Exception):
+                self.prediction_store.close()
+        self.mask_stores.clear()
+        self.prediction_store = None
 
 
 class YOLO_octron:
@@ -397,7 +490,14 @@ class YOLO_octron:
             )
 
         logger.debug(f"Watershed: {self.enable_watershed}")
-        for no_entry, labels in enumerate(self.label_dict.values(), start=1):
+        for no_entry, (subfolder, labels) in enumerate(
+            self.label_dict.items(), start=1
+        ):
+            # Mosaic videos: an object seen in several cameras is one
+            # mask with one blob per camera. get_polygons() merges all
+            # blobs of a mask into one polygon, so split the mask by
+            # camera first (see octron.cameras.mask_within_camera).
+            camera_layout = load_layout_for_folder(subfolder)
             min_area = None
 
             for entry in labels:
@@ -465,107 +565,129 @@ class YOLO_octron:
                 ):
                     mask_polys = []  # List of polygons for the current frame
                     for mask_array in mask_arrays:
-                        mask_raw = mask_array[f]
-                        # Determine area threshold
-                        min_area = (
-                            MIN_SIZE_RATIO_OBJECT_FRAME
-                            * mask_raw.shape[0]
-                            * mask_raw.shape[1]
-                        )
-                        # Split ID-encoded multi-object masks into
-                        # per-ID binary sub-masks.
-                        # ID-encoded masks have values > 1 (each
-                        # unique positive int = one object).
-                        # Legacy binary masks (0/1) pass through unchanged.
-                        positive_ids = np.unique(mask_raw)
-                        positive_ids = positive_ids[positive_ids > 0]
-                        if len(positive_ids) > 1 or np.any(positive_ids > 1):
-                            sub_masks = [
-                                (mask_raw == oid).astype(np.uint8)
-                                for oid in positive_ids
-                            ]
+                        mask_full = np.asarray(mask_array[f])
+                        if camera_layout is None:
+                            mask_parts = [mask_full]
                         else:
-                            sub_masks = [
-                                np.clip(mask_raw, 0, 1).astype(np.uint8)
+                            mask_parts = [
+                                mask_within_camera(mask_full, cam)
+                                for cam in camera_layout
                             ]
-                        for mask_current_array in sub_masks:
-                            if self.enable_watershed:
-                                # Watershed
-                                try:
-                                    _, water_masks = watershed_mask(
-                                        mask_current_array,
-                                        footprint_diameter=median_obj_diameter,
-                                        min_size_ratio=MIN_SIZE_RATIO_OBJECT_MAX,
-                                        plot=False,
-                                    )
-                                except AssertionError:
-                                    # The mask is empty at this frame
-                                    # or the object spans the whole
-                                    # frame
-                                    continue
-                                # Loop over watershedded masks
-                                for mask in water_masks:
-                                    # AssertionError: the mask is empty at
-                                    # this frame. This happens if there is
-                                    # more than one mask zarr array (because
-                                    # there are multiple instances of a
-                                    # label), and the current label is not
-                                    # present in the current mask array.
-                                    with contextlib.suppress(AssertionError):
-                                        mask_polys.append(get_polygons(mask))
+                        for mask_raw in mask_parts:
+                            if camera_layout is not None and not np.any(
+                                mask_raw > 0
+                            ):
+                                continue
+                            # Determine area threshold
+                            min_area = (
+                                MIN_SIZE_RATIO_OBJECT_FRAME
+                                * mask_raw.shape[0]
+                                * mask_raw.shape[1]
+                            )
+                            # Split ID-encoded multi-object masks into
+                            # per-ID binary sub-masks.
+                            # ID-encoded masks have values > 1 (each
+                            # unique positive int = one object).
+                            # Legacy binary masks (0/1) pass through unchanged.
+                            positive_ids = np.unique(mask_raw)
+                            positive_ids = positive_ids[positive_ids > 0]
+                            if len(positive_ids) > 1 or np.any(
+                                positive_ids > 1
+                            ):
+                                sub_masks = [
+                                    (mask_raw == oid).astype(np.uint8)
+                                    for oid in positive_ids
+                                ]
                             else:
-                                # No watershedding
-                                mask_labeled = np.asarray(
-                                    measure.label(mask_current_array)
-                                )
-                                unique_labels = np.unique(mask_labeled)
-                                assert len(unique_labels) >= 1, (
-                                    f"Labeling failed for {label} "
-                                    f"in frame {f_no}"
-                                )
-                                # Get new region props to filter out
-                                # small-ish regions
-                                props = measure.regionprops_table(
-                                    mask_labeled, properties=("area", "label")
-                                )
-                                if not len(props["area"]):
-                                    continue
-                                # Filter out small objects by setting
-                                # them to 0 and those that are smaller
-                                # than a certain size ratio smaller
-                                # than the max object size
-                                max_area = np.percentile(props["area"], 99.0)
-                                for i, area in enumerate(props["area"]):
-                                    if area < min_area:
-                                        mask_labeled[
-                                            mask_labeled == props["label"][i]
-                                        ] = 0
-                                    if (
-                                        area
-                                        < MIN_SIZE_RATIO_OBJECT_MAX * max_area
-                                    ):
-                                        mask_labeled[
-                                            mask_labeled == props["label"][i]
-                                        ] = 0
-                                if np.sum(mask_labeled) == 0:
-                                    # No objects found after filtering
-                                    continue
-                                unique_labels = np.unique(mask_labeled)
-                                for lbl in unique_labels:
-                                    if lbl == 0:
-                                        # Background
+                                sub_masks = [
+                                    np.clip(mask_raw, 0, 1).astype(np.uint8)
+                                ]
+                            for mask_current_array in sub_masks:
+                                if self.enable_watershed:
+                                    # Watershed
+                                    try:
+                                        _, water_masks = watershed_mask(
+                                            mask_current_array,
+                                            footprint_diameter=median_obj_diameter,
+                                            min_size_ratio=MIN_SIZE_RATIO_OBJECT_MAX,
+                                            plot=False,
+                                        )
+                                    except AssertionError:
+                                        # The mask is empty at this frame
+                                        # or the object spans the whole
+                                        # frame
                                         continue
-                                    else:
-                                        # Re-initialize the mask
-                                        mask_current_array = np.zeros_like(
-                                            mask_current_array
-                                        )
-                                        mask_current_array[
-                                            mask_labeled == lbl
-                                        ] = 1
-                                        mask_polys.append(
-                                            get_polygons(mask_current_array)
-                                        )
+                                    # Loop over watershedded masks
+                                    for mask in water_masks:
+                                        # Empty mask here: several mask
+                                        # arrays per label, this one absent.
+                                        with contextlib.suppress(
+                                            AssertionError
+                                        ):
+                                            mask_polys.append(
+                                                get_polygons(mask)
+                                            )
+                                else:
+                                    # No watershedding
+                                    mask_labeled = np.asarray(
+                                        measure.label(mask_current_array)
+                                    )
+                                    unique_labels = np.unique(mask_labeled)
+                                    assert len(unique_labels) >= 1, (
+                                        f"Labeling failed for {label} "
+                                        f"in frame {f_no}"
+                                    )
+                                    # Get new region props to filter out
+                                    # small-ish regions
+                                    props = measure.regionprops_table(
+                                        mask_labeled,
+                                        properties=("area", "label"),
+                                    )
+                                    if not len(props["area"]):
+                                        continue
+                                    # Filter out small objects by setting
+                                    # them to 0 and those that are smaller
+                                    # than a certain size ratio smaller
+                                    # than the max object size
+                                    max_area = np.percentile(
+                                        props["area"], 99.0
+                                    )
+                                    for i, area in enumerate(props["area"]):
+                                        if area < min_area:
+                                            mask_labeled[
+                                                mask_labeled
+                                                == props["label"][i]
+                                            ] = 0
+                                        if (
+                                            area
+                                            < MIN_SIZE_RATIO_OBJECT_MAX
+                                            * max_area
+                                        ):
+                                            mask_labeled[
+                                                mask_labeled
+                                                == props["label"][i]
+                                            ] = 0
+                                    if np.sum(mask_labeled) == 0:
+                                        # No objects found after filtering
+                                        continue
+                                    unique_labels = np.unique(mask_labeled)
+                                    for lbl in unique_labels:
+                                        if lbl == 0:
+                                            # Background
+                                            continue
+                                        else:
+                                            # Re-initialize the mask
+                                            mask_current_array = np.zeros_like(
+                                                mask_current_array
+                                            )
+                                            mask_current_array[
+                                                mask_labeled == lbl
+                                            ] = 1
+                                            mask_polys.append(
+                                                get_polygons(
+                                                    mask_current_array
+                                                )
+                                            )
 
                     polys[f] = mask_polys
                     # Yield, to update the progress bar
@@ -2573,6 +2695,337 @@ class YOLO_octron:
 
         return natsorted(found_models_project)
 
+    def _track_camera_frame(
+        self,
+        state,
+        *,
+        frame_no,
+        frame_idx,
+        frame,
+        boxes,
+        confidences,
+        classes,
+        label_names,
+        masks,
+        identity_probs,
+        model_names,
+        is_segment,
+        per_class,
+        one_object_per_label,
+        iou_thresh,
+        opening_radius,
+        region_details,
+        region_properties,
+        extra_properties,
+        buffer_size,
+        identity_clf,
+    ):
+        """Track one frame's detections for one camera.
+
+        Feeds the camera's detections to its BoxMOT tracker and records
+        every matched detection in the camera's tracking dataframes and
+        mask stores. All coordinates are in camera-crop space.
+
+        Parameters
+        ----------
+        state : _CameraTrackingState
+            Per-camera tracker, stores and dataframes.
+        frame_no, frame_idx : int
+            Counter of analysed frames and original video frame index.
+        frame : np.ndarray
+            RGB frame (camera crop).
+        boxes, confidences, classes : np.ndarray
+            Detections in camera coordinates: ``(N, 4)`` xyxy boxes,
+            ``(N,)`` confidences and class ids.
+        label_names : list of str
+            Class name per detection.
+        masks : np.ndarray or None
+            ``(N, H, W)`` masks (segmentation) or None.
+        identity_probs : np.ndarray or None
+            ``(N, n_identities)`` classifier probabilities or None.
+        model_names : dict
+            Detector class id to name mapping.
+        is_segment, per_class, one_object_per_label : bool
+            Model task and tracking mode flags.
+        iou_thresh : float
+            IOU threshold (``< 0.01`` fuses masks per label).
+        opening_radius : int
+            Morphological opening radius for masks.
+        region_details : bool
+            Whether regionprops are extracted.
+        region_properties, extra_properties : tuple or None
+            regionprops_table properties / custom callables.
+        buffer_size : int
+            Frames buffered before masks are written to zarr.
+        identity_clf : IdentityClassifier or None
+            Classifier used to decide identity columns.
+
+        """
+        # Pass things to the boxmot tracker
+        # INPUT:  M X (x, y, x, y, conf, cls)
+        tracker_input = np.hstack(
+            [
+                boxes,
+                confidences[:, np.newaxis],
+                classes[:, np.newaxis],
+            ]
+        )
+        try:
+            tracking_result = state.tracker.update(tracker_input, frame)
+        except Exception as e:
+            logger.warning(
+                f"Tracker error on frame {frame_idx} "
+                f"({state.camera.name}): {e}"
+            )
+            return
+        if tracking_result.shape[0] == 0:
+            logger.debug(f"No tracking result found for frame_idx {frame_idx}")
+            return
+
+        # Map tracking results to original detections
+        tracked_ids, tracked_idxs = self.map_detection_index(
+            tracker_input,
+            tracking_result,
+            per_class=per_class,
+            verbose=False,
+        )
+        # Skip if no valid tracks found
+        if not tracked_idxs:
+            logger.debug(f"No valid tracks mapped for frame_idx {frame_idx}")
+            return
+
+        # Filter all result arrays using tracked_box_indices
+        tracked_confidences = confidences[tracked_idxs]
+        tracked_label_names = [label_names[i] for i in tracked_idxs]
+        tracked_boxes = boxes[tracked_idxs]
+        tracked_masks = (
+            masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs)
+        )
+        tracked_identity = (
+            identity_probs[tracked_idxs]
+            if identity_probs is not None
+            else [None] * len(tracked_idxs)
+        )
+
+        tracking_df_dict = state.tracking_df_dict
+        track_id_label_dict = state.track_id_label_dict
+        mask_buffers = state.mask_buffers
+        buffer_counts = state.buffer_counts
+        mask_stores = state.mask_stores
+
+        # Extract tracks
+        for track_id, label, conf, bbox, mask, ident_row in zip(
+            tracked_ids,
+            tracked_label_names,
+            tracked_confidences,
+            tracked_boxes,
+            tracked_masks,
+            tracked_identity,
+            strict=False,
+        ):
+            # Figure out if you can use the track_id or
+            # whether it needs to be replaced - this is a
+            # special case for when "1 subject"
+            # (one_object_per_label) is active
+
+            if one_object_per_label or iou_thresh < 0.01:
+                # ! Use 'label' as keys in track_id_label_dict
+                # There is only one object/track ID per label
+                if label in track_id_label_dict:
+                    # Overwrite whatever current track ID is
+                    # assigned to this label
+                    track_id = track_id_label_dict[label]
+                else:
+                    # Assign a new, custom track ID
+                    current_ids = list(track_id_label_dict.values())
+                    track_id = (max(current_ids) + 1) if current_ids else 1
+                    track_id_label_dict[label] = track_id
+            else:
+                # There can be multiple objects/track IDs per
+                # label. A boxmot track ID can be matched to
+                # detections of different classes over its
+                # lifetime: boxmot associates class-agnostically
+                # and overwrites a track's class on every match,
+                # only preserving class identity when
+                # per_class=True (which several trackers, incl.
+                # BoostTrack, do not support). Map each
+                # (boxmot track ID, label) pair to a stable
+                # OCTRON track ID so a mid-track class change
+                # becomes a separate, label-consistent tracklet
+                # instead of raising.
+                pair_key = (track_id, label)
+                if pair_key not in state.split_track_ids:
+                    state.split_track_ids[pair_key] = state.next_split_track_id
+                    state.next_split_track_id += 1
+                track_id = state.split_track_ids[pair_key]
+
+            # Take care of zarr array and tracking dataframe
+            if track_id not in state.all_ids:
+                # Initialize mask store (only for segmentation models)
+                if is_segment:
+                    video_shape = (
+                        state.video_dict["num_frames"],
+                        state.video_dict["height"],
+                        state.video_dict["width"],
+                    )
+                    mask_store = create_prediction_zarr(
+                        state.prediction_store,
+                        f"{track_id}_masks",
+                        shape=video_shape,
+                        # 1 frame/chunk: napari reads one
+                        # frame per seek.
+                        chunk_size=1,
+                        fill_value=-1,
+                        dtype="int8",
+                        video_hash="",
+                    )
+                    mask_store.attrs["label"] = label
+                    mask_store.attrs["classes"] = model_names
+                    mask_buffers[track_id] = {}
+                    buffer_counts[track_id] = 0
+                    mask_stores[track_id] = mask_store
+
+                # Initialize tracking dataframe
+                tracking_df = self.create_tracking_dataframe(
+                    state.video_dict,
+                    region_properties=region_properties,
+                    extra_properties=extra_properties,
+                )
+                tracking_df.attrs["video_name"] = state.video_dict.get(
+                    "video_name", ""
+                )
+                tracking_df.attrs["label"] = label
+                tracking_df.attrs["track_id"] = track_id
+                tracking_df_dict[track_id] = tracking_df
+
+                state.all_ids.append(track_id)
+            else:
+                tracking_df = tracking_df_dict[track_id]
+                assert tracking_df.attrs["track_id"] == track_id, "ID mismatch"
+                assert tracking_df.attrs["label"] == label, "Label mismatch"
+                if is_segment:
+                    mask_store = mask_stores[track_id]
+
+            # Check if a row already exists and compare
+            # current confidence with existing one
+            # This happens if one_object_per_label is True or
+            # iou_thresh < 0.01 and there are multiple
+            # detections
+            idx = (frame_no, frame_idx, track_id)
+            if idx in tracking_df.index:
+                existing_conf = tracking_df.loc[idx, "confidence"]
+                if conf <= existing_conf and iou_thresh >= 0.01:
+                    # Skip this detection if a better one
+                    # already exists and we are not fusing
+                    # masks (iou_thresh > 0)
+                    continue
+                else:
+                    # Average the confidence values
+                    conf = (conf + existing_conf) / 2
+
+            # Mask processing (segmentation models only)
+            if is_segment:
+                mask = postprocess_mask(mask, opening_radius=opening_radius)
+                if iou_thresh < 0.01:
+                    # Fuse this mask with prior mask (if any)
+                    # from buffer or zarr
+                    if frame_idx in mask_buffers[track_id]:
+                        previous_mask = mask_buffers[track_id][
+                            frame_idx
+                        ].copy()
+                    else:
+                        previous_mask = mask_store[frame_idx, :, :].copy()
+                        previous_mask[previous_mask == -1] = 0
+                    mask = np.logical_or(previous_mask, mask)
+                    mask = mask.astype("int8")
+                # Add to buffer instead of writing directly
+                mask_buffers[track_id][frame_idx] = mask
+                buffer_counts[track_id] = buffer_counts.get(track_id, 0) + 1
+                if buffer_counts[track_id] >= buffer_size:
+                    state.flush_mask_buffer(track_id)
+
+            # Store tracking data directly (no buffering for
+            # tracking dataframes)
+            tracking_df.loc[idx, "pos_x"] = (bbox[0] + bbox[2]) / 2
+            tracking_df.loc[idx, "pos_y"] = (bbox[1] + bbox[3]) / 2
+            bbox_w = bbox[2] - bbox[0]
+            bbox_h = bbox[3] - bbox[1]
+            tracking_df.loc[idx, "bbox_area"] = bbox_w * bbox_h
+            tracking_df.loc[idx, "bbox_aspect_ratio"] = (
+                bbox_w / bbox_h if bbox_h > 0 else np.nan
+            )
+            tracking_df.loc[idx, "bbox_x_min"] = bbox[0]
+            tracking_df.loc[idx, "bbox_x_max"] = bbox[2]
+            tracking_df.loc[idx, "bbox_y_min"] = bbox[1]
+            tracking_df.loc[idx, "bbox_y_max"] = bbox[3]
+            tracking_df.loc[idx, "confidence"] = conf
+
+            # Identity columns: argmax among the individuals of this
+            # label plus the full probability vector, which the
+            # post-hoc exclusivity pass (octron link) sums per tracklet.
+            if identity_clf is not None and ident_row is not None:
+                identity, identity_conf = identity_clf.decide(ident_row, label)
+                tracking_df.loc[idx, "identity"] = (
+                    identity if identity is not None else np.nan
+                )
+                tracking_df.loc[idx, "identity_conf"] = identity_conf
+                for col, prob in zip(
+                    identity_clf.prob_columns, ident_row, strict=True
+                ):
+                    tracking_df.loc[idx, col] = float(prob)
+
+            # If region_properties or extra_properties are
+            # specified, supplement info from regionprops
+            # extraction (only available for segmentation
+            # models with masks)
+            regions_props = None
+            if region_details and is_segment:
+                _, regions_props = find_objects_in_mask(
+                    mask,
+                    min_area=0,
+                    properties=region_properties,
+                    intensity_image=frame,
+                    extra_properties=extra_properties,
+                )
+                if not regions_props:
+                    # Skip if no regions were found
+                    continue
+
+                # Collect property keys (expanded names from
+                # regionprops_table)
+                _skip = {"label", "centroid"}
+                all_prop_keys = [k for k in regions_props[0] if k not in _skip]
+
+                if len(regions_props) == 1:
+                    # Single region — store scalars directly
+                    region = regions_props[0]
+                    centroid = region["centroid"]
+                    tracking_df.loc[idx, "pos_x"] = centroid[1]
+                    tracking_df.loc[idx, "pos_y"] = centroid[0]
+                    for k in all_prop_keys:
+                        tracking_df.loc[idx, k] = region[k]
+                else:
+                    # Multiple disconnected regions in one
+                    # detection mask.
+                    # Store a tuple of per-region values as a
+                    # string so no information is lost.
+                    # Stored as e.g. "(120.5, 85.3)".
+                    # This avoids pandas dtype conflicts
+                    # (float columns cannot hold tuple
+                    # objects) and is parsed back by
+                    # _resolve_tuples() during results loading.
+                    centroids = [r["centroid"] for r in regions_props]
+                    tracking_df.loc[idx, "pos_x"] = str(
+                        tuple(float(c[1]) for c in centroids)
+                    )
+                    tracking_df.loc[idx, "pos_y"] = str(
+                        tuple(float(c[0]) for c in centroids)
+                    )
+                    for k in all_prop_keys:
+                        tracking_df.loc[idx, k] = str(
+                            tuple(float(r[k]) for r in regions_props)
+                        )
+
     def map_detection_index(
         self,
         tracker_input,
@@ -2723,6 +3176,10 @@ class YOLO_octron:
         buffer_size=500,
         output_dir=None,
         local_cache_dir=None,
+        cameras=None,
+        identity_weights=None,
+        identity_imgsz=224,
+        identity_padding=0.1,
     ):
         """Predict and track objects in multiple videos.
 
@@ -2806,6 +3263,27 @@ class YOLO_octron:
             its final destination. Takes precedence over the
             ``prediction_cache_dir`` setting in config.yaml. Off when both
             are None.
+        cameras : str, Path, CameraLayout, dict, optional
+            Camera layout for mosaic videos (several synchronised cameras
+            tiled into one frame). A path to a ``cameras.json``, a
+            ``CameraLayout``, a layout dict, or a dict mapping video
+            name to one of those. When None, a sibling
+            ``<video stem>_cameras.json`` next to the video is used if
+            present; otherwise the whole frame is one camera. With a
+            layout, detection runs on the full frame, each detection is
+            assigned to the camera containing its box centre, and every
+            camera gets its own tracker and output folder
+            ``<save_dir>/<camera name>/`` in camera-crop coordinates.
+        identity_weights : str or Path, optional
+            Trained identity classifier (``octron train-identity``).
+            When given, every tracked box is scored per frame and the
+            tracking CSVs gain ``identity``, ``identity_conf`` and one
+            ``identity_prob_<class>`` column per individual.
+        identity_imgsz : int
+            Classifier input size.
+        identity_padding : float
+            Fractional padding of the classifier crops; must match the
+            value used to build the identity dataset.
 
         Yields
         ------
@@ -2929,6 +3407,29 @@ class YOLO_octron:
             extra_properties = None
             region_details = False
             opening_radius = 0
+
+        # Optional identity classifier (species detector + post-hoc
+        # identity workflow, see octron.yolo_octron.identity)
+        identity_clf = None
+        if identity_weights is not None:
+            from octron.yolo_octron.identity import IdentityClassifier
+
+            identity_clf = IdentityClassifier(
+                identity_weights,
+                device=device,
+                imgsz=identity_imgsz,
+                padding=identity_padding,
+            )
+            logger.info(
+                f"Identity classifier: {identity_clf.weights.name} "
+                f"({len(identity_clf.class_names)} individuals)"
+            )
+
+        def _cameras_for_video(video_name, video_path):
+            """Pick the camera spec for one video from ``cameras``."""
+            if isinstance(cameras, dict) and "cameras" not in cameras:
+                return cameras.get(video_name, cameras.get(str(video_path)))
+            return cameras
 
         # Try to find model args
         model_args = self.load_model_args(model_name_path=model_path)
@@ -3075,7 +3576,27 @@ class YOLO_octron:
 
             save_dir.mkdir(parents=True, exist_ok=True)
 
-            # Set up boxmot tracker
+            # Camera layout. A mosaic video (several synchronised cameras
+            # tiled into one frame) is described by a cameras.json; each
+            # camera then becomes its own "virtual video": its own
+            # tracker, its own predictions.zarr and CSVs in
+            # <save_dir>/<camera name>/, in camera-crop coordinates.
+            # Without a layout, everything stays in <save_dir> as before.
+            layout, multi_camera = resolve_layout(
+                video_path,
+                video_dict["width"],
+                video_dict["height"],
+                cameras=_cameras_for_video(video_name, video_path),
+            )
+            if multi_camera:
+                layout.validate()
+                layout.save(save_dir / CAMERAS_FILENAME, overwrite=True)
+                logger.info(
+                    f"Camera layout with {len(layout)} camera(s): "
+                    f"{', '.join(layout.names)}"
+                )
+
+            # Set up boxmot tracker(s), one per camera
             # Encourage garbage collection of any old tracker objects
             gc.collect()
             is_reid = tracker_config[tracker_id]["is_reid"]
@@ -3103,83 +3624,60 @@ class YOLO_octron:
                     )
                 else:
                     reid_weights = reid_model
-            tracker = create_tracker(
-                tracker_type=tracker_config[tracker_id]["tracker_type"],
-                reid_weights=reid_weights,
-                device=device,
-                per_class=per_class,
-                evolve_param_dict=custom_tracker_params,
-            )
-            # Reset any internal state the tracker might have
-            # September 2025: This is currently not handled
-            # consistently across BoxMot trackers
-            # TODO: Follow up on this
-            if hasattr(tracker, "reset"):
-                tracker.reset()  # Call reset if available
-            elif hasattr(tracker, "tracker") and hasattr(
-                tracker.tracker, "reset"
-            ):
-                tracker.tracker.reset()
-            if hasattr(tracker, "tracks"):
-                tracker.tracks = []
 
-            # Prepare prediction stores (segmentation only —
-            # detection has no masks)
-            prediction_store = None
-            if is_segment:
-                prediction_store_dir = save_dir / "predictions.zarr"
-                prediction_store = create_prediction_store(
-                    prediction_store_dir
+            def _make_tracker(
+                _reid_weights=reid_weights,
+                _per_class=per_class,
+                _params=custom_tracker_params,
+            ):
+                tracker = create_tracker(
+                    tracker_type=tracker_config[tracker_id]["tracker_type"],
+                    reid_weights=_reid_weights,
+                    device=device,
+                    per_class=_per_class,
+                    evolve_param_dict=_params,
+                )
+                # Reset any internal state the tracker might have
+                # September 2025: This is currently not handled
+                # consistently across BoxMot trackers
+                # TODO: Follow up on this
+                if hasattr(tracker, "reset"):
+                    tracker.reset()  # Call reset if available
+                elif hasattr(tracker, "tracker") and hasattr(
+                    tracker.tracker, "reset"
+                ):
+                    tracker.tracker.reset()
+                if hasattr(tracker, "tracks"):
+                    tracker.tracks = []
+                return tracker
+
+            states = {}
+            for camera in layout:
+                cam_dir = save_dir / camera.name if multi_camera else save_dir
+                cam_dir.mkdir(parents=True, exist_ok=True)
+                cam_video_dict = dict(video_dict)
+                cam_video_dict["height"] = camera.height
+                cam_video_dict["width"] = camera.width
+                cam_video_dict["video_name"] = video_name
+                # Prepare prediction stores (segmentation only —
+                # detection has no masks)
+                prediction_store = None
+                if is_segment:
+                    prediction_store = create_prediction_store(
+                        cam_dir / "predictions.zarr"
+                    )
+                states[camera.name] = _CameraTrackingState(
+                    camera=camera,
+                    save_dir=cam_dir,
+                    video_dict=cam_video_dict,
+                    tracker=_make_tracker(),
+                    prediction_store=prediction_store,
                 )
 
             # Process video frames
             video = video_dict["video"]
-            tracking_df_dict = {}
-            track_id_label_dict = {}
-            # Standard (multi-object) tracking maps each
-            # (boxmot track ID, label) pair to a stable OCTRON track ID
-            # (see the else-branch below), so a boxmot ID that is matched
-            # to different classes over time is split into separate,
-            # label-consistent tracklets instead of raising.
-            split_track_ids = {}
-            next_split_track_id = 1
             video_prediction_start = time.time()
             frame_start = time.time()
-            all_ids = []
-
-            # Initialize buffer structures for masks (segmentation only)
-            mask_buffers = {}  # track_id -> {frame_idx: mask}
-            buffer_counts = {}  # track_id -> count
-            mask_stores = {}  # track_id -> zarr array
-
-            # B023: the closure reads the buffer dicts of the current
-            # video-loop iteration only and is never called after the
-            # iteration ends, so late binding is safe here.
-            def _flush_mask_buffer(track_id):
-                """Flush a track's mask buffer to disk."""
-                if (
-                    track_id not in buffer_counts  # noqa: B023
-                    or buffer_counts[track_id] == 0  # noqa: B023
-                ):
-                    return
-
-                # Get the buffer and store
-                mask_buffer = mask_buffers[track_id]  # noqa: B023
-                mask_store = mask_stores[track_id]  # noqa: B023
-                frame_indices = sorted(mask_buffer.keys())
-                stacked_masks = np.stack(
-                    [mask_buffer[idx] for idx in frame_indices]
-                )
-                mask_store[frame_indices, :, :] = stacked_masks
-                mark_frames_annotated(mask_store, frame_indices)
-
-                # Clear buffer
-                mask_buffers[track_id].clear()  # noqa: B023
-                buffer_counts[track_id] = 0  # noqa: B023
-                logger.debug(
-                    f"Saved mask buffer for track {track_id} to zarr "
-                    f"({len(frame_indices)} frames)"
-                )
 
             for frame_no, frame_idx in enumerate(
                 video_dict["frame_iterator"], start=0
@@ -3210,7 +3708,7 @@ class YOLO_octron:
                     "frame_time": frame_time,
                 }
                 frame_start = time.time()
-                # Run tracking on this frame
+                # Run detection on the full (mosaic) frame
                 results = model.predict(
                     source=frame,
                     task=model_task,
@@ -3249,329 +3747,68 @@ class YOLO_octron:
                     logger.debug(f"No result for frame_idx {frame_idx}: {e}")
                     continue
 
-                # Pass things to the boxmot tracker
-                # INPUT:  M X (x, y, x, y, conf, cls)
-                tracker_input = np.hstack(
-                    [
-                        boxes,
-                        confidences[:, np.newaxis],
-                        classes[:, np.newaxis],
+                # Identity: score every detection crop once, in full
+                # frame coordinates, before the split into cameras.
+                identity_probs = None
+                if identity_clf is not None and len(boxes):
+                    identity_probs = identity_clf.classify(frame, boxes)
+
+                # Split detections between cameras by box centre
+                assigned = layout.assign_boxes(boxes)
+                for camera in layout:
+                    det_idxs = [
+                        i
+                        for i, cam in enumerate(assigned)
+                        if cam is not None and cam.name == camera.name
                     ]
-                )
-                try:
-                    tracking_result = tracker.update(tracker_input, frame)
-                except Exception as e:
-                    logger.warning(f"Tracker error on frame {frame_idx}: {e}")
-                    continue
-                if tracking_result.shape[0] == 0:
-                    logger.debug(
-                        f"No tracking result found for frame_idx {frame_idx}"
-                    )
-                    continue
-
-                # Map tracking results to original detections
-                tracked_ids, tracked_idxs = self.map_detection_index(
-                    tracker_input,
-                    tracking_result,
-                    per_class=per_class,
-                    verbose=False,
-                )
-                # Skip if no valid tracks found
-                if not tracked_idxs:
-                    logger.debug(
-                        f"No valid tracks mapped for frame_idx {frame_idx}"
-                    )
-                    continue
-
-                # Filter all result arrays using tracked_box_indices
-                tracked_confidences = confidences[tracked_idxs]
-                tracked_label_names = [label_names[i] for i in tracked_idxs]
-                tracked_boxes = boxes[tracked_idxs]
-                tracked_masks = (
-                    masks[tracked_idxs]
-                    if is_segment
-                    else [None] * len(tracked_idxs)
-                )
-
-                # Extract tracks
-                for track_id, label, conf, bbox, mask in zip(
-                    tracked_ids,
-                    tracked_label_names,
-                    tracked_confidences,
-                    tracked_boxes,
-                    tracked_masks,
-                    strict=False,
-                ):
-                    # Figure out if you can use the track_id or
-                    # whether it needs to be replaced - this is a
-                    # special case for when "1 subject"
-                    # (one_object_per_label) is active
-
-                    if one_object_per_label or iou_thresh < 0.01:
-                        # ! Use 'label' as keys in track_id_label_dict
-                        # There is only one object/track ID per label
-                        if label in track_id_label_dict:
-                            # Overwrite whatever current track ID is
-                            # assigned to this label
-                            track_id = track_id_label_dict[label]
-                        else:
-                            # Assign a new, custom track ID
-                            current_ids = list(track_id_label_dict.values())
-                            track_id = (
-                                (max(current_ids) + 1) if current_ids else 1
-                            )
-                            track_id_label_dict[label] = track_id
+                    if not det_idxs:
+                        continue
+                    state = states[camera.name]
+                    if multi_camera:
+                        cam_frame = np.ascontiguousarray(camera.crop(frame))
+                        cam_boxes = np.array(
+                            [camera.shift_box(boxes[i]) for i in det_idxs]
+                        )
+                        cam_masks = (
+                            np.stack([camera.crop(masks[i]) for i in det_idxs])
+                            if is_segment
+                            else None
+                        )
                     else:
-                        # There can be multiple objects/track IDs per
-                        # label. A boxmot track ID can be matched to
-                        # detections of different classes over its
-                        # lifetime: boxmot associates class-agnostically
-                        # and overwrites a track's class on every match,
-                        # only preserving class identity when
-                        # per_class=True (which several trackers, incl.
-                        # BoostTrack, do not support). Map each
-                        # (boxmot track ID, label) pair to a stable
-                        # OCTRON track ID so a mid-track class change
-                        # becomes a separate, label-consistent tracklet
-                        # instead of raising.
-                        pair_key = (track_id, label)
-                        if pair_key not in split_track_ids:
-                            split_track_ids[pair_key] = next_split_track_id
-                            next_split_track_id += 1
-                        track_id = split_track_ids[pair_key]
-
-                    # Take care of zarr array and tracking dataframe
-                    if track_id not in all_ids:
-                        # Initialize mask store (only for segmentation models)
-                        if is_segment:
-                            video_shape = (
-                                video_dict["num_frames"],
-                                video_dict["height"],
-                                video_dict["width"],
-                            )
-                            mask_store = create_prediction_zarr(
-                                prediction_store,
-                                f"{track_id}_masks",
-                                shape=video_shape,
-                                # 1 frame/chunk: napari reads one
-                                # frame per seek.
-                                chunk_size=1,
-                                fill_value=-1,
-                                dtype="int8",
-                                video_hash="",
-                            )
-                            mask_store.attrs["label"] = label
-                            mask_store.attrs["classes"] = results[0].names
-                            mask_buffers[track_id] = {}
-                            buffer_counts[track_id] = 0
-                            mask_stores[track_id] = mask_store
-
-                        # Initialize tracking dataframe
-                        tracking_df = self.create_tracking_dataframe(
-                            video_dict,
-                            region_properties=region_properties,
-                            extra_properties=extra_properties,
-                        )
-                        tracking_df.attrs["video_name"] = video_name
-                        tracking_df.attrs["label"] = label
-                        tracking_df.attrs["track_id"] = track_id
-                        tracking_df_dict[track_id] = tracking_df
-
-                        all_ids.append(track_id)
-                    else:
-                        tracking_df = tracking_df_dict[track_id]
-                        assert tracking_df.attrs["track_id"] == track_id, (
-                            "ID mismatch"
-                        )
-                        assert tracking_df.attrs["label"] == label, (
-                            "Label mismatch"
-                        )
-                        if is_segment:
-                            mask_store = mask_stores[track_id]
-
-                    # Check if a row already exists and compare
-                    # current confidence with existing one
-                    # This happens if one_object_per_label is True or
-                    # iou_thresh < 0.01 and there are multiple
-                    # detections
-                    if (frame_no, frame_idx, track_id) in tracking_df.index:
-                        existing_conf = tracking_df.loc[
-                            (frame_no, frame_idx, track_id), "confidence"
-                        ]
-                        if conf <= existing_conf and iou_thresh >= 0.01:
-                            # Skip this detection if a better one
-                            # already exists and we are not fusing
-                            # masks (iou_thresh > 0)
-                            continue
-                        else:
-                            # Average the confidence values
-                            conf = (conf + existing_conf) / 2
-
-                    # Mask processing (segmentation models only)
-                    if is_segment:
-                        mask = postprocess_mask(
-                            mask, opening_radius=opening_radius
-                        )
-                        if iou_thresh < 0.01:
-                            # Fuse this mask with prior mask (if any)
-                            # from buffer or zarr
-                            if frame_idx in mask_buffers[track_id]:
-                                previous_mask = mask_buffers[track_id][
-                                    frame_idx
-                                ].copy()
-                            else:
-                                previous_mask = mask_store[
-                                    frame_idx, :, :
-                                ].copy()
-                                previous_mask[previous_mask == -1] = 0
-                            mask = np.logical_or(previous_mask, mask)
-                            mask = mask.astype("int8")
-                        # Add to buffer instead of writing directly
-                        mask_buffers[track_id][frame_idx] = mask
-                        buffer_counts[track_id] = (
-                            buffer_counts.get(track_id, 0) + 1
-                        )
-                        if buffer_counts[track_id] >= buffer_size:
-                            _flush_mask_buffer(track_id)
-
-                    # Store tracking data directly (no buffering for
-                    # tracking dataframes)
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "pos_x"
-                    ] = (bbox[0] + bbox[2]) / 2
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "pos_y"
-                    ] = (bbox[1] + bbox[3]) / 2
-                    bbox_w = bbox[2] - bbox[0]
-                    bbox_h = bbox[3] - bbox[1]
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_area"
-                    ] = bbox_w * bbox_h
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_aspect_ratio"
-                    ] = bbox_w / bbox_h if bbox_h > 0 else np.nan
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_x_min"
-                    ] = bbox[0]
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_x_max"
-                    ] = bbox[2]
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_y_min"
-                    ] = bbox[1]
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "bbox_y_max"
-                    ] = bbox[3]
-                    tracking_df.loc[
-                        (frame_no, frame_idx, track_id), "confidence"
-                    ] = conf
-
-                    # If region_properties or extra_properties are
-                    # specified, supplement info from regionprops
-                    # extraction (only available for segmentation
-                    # models with masks)
-                    regions_props = None
-                    if region_details and is_segment:
-                        _, regions_props = find_objects_in_mask(
-                            mask,
-                            min_area=0,
-                            properties=region_properties,
-                            intensity_image=frame,
-                            extra_properties=extra_properties,
-                        )
-                        if not regions_props:
-                            # Skip if no regions were found
-                            continue
-
-                        # Collect property keys (expanded names from
-                        # regionprops_table)
-                        _skip = {"label", "centroid"}
-                        all_prop_keys = [
-                            k for k in regions_props[0] if k not in _skip
-                        ]
-
-                        if len(regions_props) == 1:
-                            # Single region — store scalars directly
-                            region = regions_props[0]
-                            centroid = region["centroid"]
-                            tracking_df.loc[
-                                (frame_no, frame_idx, track_id), "pos_x"
-                            ] = centroid[1]
-                            tracking_df.loc[
-                                (frame_no, frame_idx, track_id), "pos_y"
-                            ] = centroid[0]
-                            for k in all_prop_keys:
-                                tracking_df.loc[
-                                    (frame_no, frame_idx, track_id), k
-                                ] = region[k]
-                        else:
-                            # Multiple disconnected regions in one
-                            # detection mask.
-                            # Store a tuple of per-region values as a
-                            # string so no information is lost.
-                            # Stored as e.g. "(120.5, 85.3)".
-                            # This avoids pandas dtype conflicts
-                            # (float columns cannot hold tuple
-                            # objects) and is parsed back by
-                            # _resolve_tuples() during results loading.
-                            idx = (frame_no, frame_idx, track_id)
-                            centroids = [r["centroid"] for r in regions_props]
-                            tracking_df.loc[idx, "pos_x"] = str(
-                                tuple(float(c[1]) for c in centroids)
-                            )
-                            tracking_df.loc[idx, "pos_y"] = str(
-                                tuple(float(c[0]) for c in centroids)
-                            )
-                            for k in all_prop_keys:
-                                tracking_df.loc[idx, k] = str(
-                                    tuple(float(r[k]) for r in regions_props)
-                                )
+                        cam_frame = frame
+                        cam_boxes = boxes[det_idxs]
+                        cam_masks = masks[det_idxs] if is_segment else None
+                    self._track_camera_frame(
+                        state,
+                        frame_no=frame_no,
+                        frame_idx=frame_idx,
+                        frame=cam_frame,
+                        boxes=cam_boxes,
+                        confidences=confidences[det_idxs],
+                        classes=classes[det_idxs],
+                        label_names=[label_names[i] for i in det_idxs],
+                        masks=cam_masks,
+                        identity_probs=(
+                            identity_probs[det_idxs]
+                            if identity_probs is not None
+                            else None
+                        ),
+                        model_names=results[0].names,
+                        is_segment=is_segment,
+                        per_class=per_class,
+                        one_object_per_label=one_object_per_label,
+                        iou_thresh=iou_thresh,
+                        opening_radius=opening_radius,
+                        region_details=region_details,
+                        region_properties=region_properties,
+                        extra_properties=extra_properties,
+                        buffer_size=buffer_size,
+                        identity_clf=identity_clf,
+                    )
 
                 # A FRAME IS COMPLETE
 
             # A VIDEO IS COMPLETE
-            if is_segment:
-                for track_id in all_ids:
-                    _flush_mask_buffer(track_id)
-
-            # Save each tracking DataFrame with a label column added
-            for track_id, tr_df in tracking_df_dict.items():
-                label = tr_df.attrs["label"]
-                df_to_save = tr_df.copy()
-                # Add the label column (will be filled with the same
-                # value for all rows)
-                df_to_save.insert(0, "label", label)
-
-                # Save to CSV with metadata header
-                filename = f"{label}_track_{track_id}.csv"
-                csv_path = save_dir / filename
-
-                # Create header with metadata
-                header = [
-                    f"video_name: {tr_df.attrs.get('video_name', 'unknown')}",
-                    f"frame_count: {tr_df.attrs.get('frame_count', '')}",
-                    f"frame_count_analyzed: "
-                    f"{tr_df.attrs.get('frame_count_analyzed', '')}",
-                    f"video_height: {tr_df.attrs.get('video_height', '')}",
-                    f"video_width: {tr_df.attrs.get('video_width', '')}",
-                    f"created_at: "
-                    f"{tr_df.attrs.get('created_at', str(datetime.now()))}",
-                    "",  # Empty line for separation
-                ]
-
-                # Write the header and then the data
-                with open(csv_path, "w") as f:
-                    f.write("\n".join(header) + "\n")
-                    df_to_save.to_csv(f, na_rep="NaN", lineterminator="\n")
-                logger.debug(
-                    f"Saved tracking data for '{label}' "
-                    f"(track ID: {track_id}) to {filename}"
-                )
-
-            # Save a json file with all metadata / parameters used
-            # for prediction
-            json_meta_path = save_dir / "prediction_metadata.json"
-
             # Prepare model_path for metadata: try to make it
             # relative if project_path is set
             meta_model_path_str = model_path.as_posix()
@@ -3612,77 +3849,104 @@ class YOLO_octron:
                     "reid_weights"
                 )  # This info exists twice
 
-            metadata_to_save = {
-                "octron_version": octron_version,
-                "prediction_start_timestamp": datetime.fromtimestamp(
-                    video_prediction_start
-                ).isoformat(),
-                "prediction_end_timestamp": datetime.now().isoformat(),
-                "model_classes": {str(k): v for k, v in model.names.items()},
-                "video_info": {
-                    "original_video_name": video_name,
-                    "original_video_path": video_dict["video_file_path"],
-                    "num_frames_original": video_dict["num_frames"],
-                    "num_frames_analyzed": video_dict["num_frames_analyzed"],
-                    "height": video_dict["height"],
-                    "width": video_dict["width"],
-                    "fps_original": video_dict.get("fps", "unknown"),
-                    # FastVideoReader uses read_format='rgb24';
-                    # intensity columns -0, -1, -2 map to R, G, B
-                    "channel_order": "rgb",
-                },
-                "prediction_parameters": {
-                    "model_path": meta_model_path_str,
-                    "model_task": model_task,
-                    "model_imgsz": imgsz,
-                    "model_retina_masks": retina_masks,
-                    "region_properties": list(region_properties)
-                    if region_properties
-                    else None,
-                    "extra_properties": [
-                        fn.__name__ for fn in extra_properties
-                    ]
-                    if extra_properties
-                    else None,
-                    "device": device,
-                    "tracker_name": tracker_name,
-                    "skip_frames": skip_frames,
-                    "one_object_per_label": one_object_per_label,
-                    "iou_thresh": iou_thresh,
-                    "conf_thresh": conf_thresh,
-                    "opening_radius": opening_radius,
-                    "overwrite_existing_predictions": overwrite,
-                },
-                "tracker_configuration": {
-                    "tracker_type": tracker_config[tracker_id]["tracker_type"],
-                    "is_reid": is_reid,
-                    "reid_model": tracker_config[tracker_id]["reid_model"]
-                    if is_reid
-                    else None,
-                    # All parameters from evolve_param_dict
-                    "parameters": custom_tracker_params,
-                },
-                "original_model_training_args": model_args
-                if model_args is not None
-                else "Model args not found",
-            }
+            identity_meta = None
+            if identity_clf is not None:
+                identity_meta = {
+                    "weights": identity_clf.weights.as_posix(),
+                    "imgsz": identity_clf.imgsz,
+                    "padding": identity_clf.padding,
+                }
 
-            with open(json_meta_path, "w") as f:
-                json.dump(metadata_to_save, f, indent=4)
-            logger.info(
-                f"Saved prediction metadata to {json_meta_path.as_posix()}"
-            )
+            for state in states.values():
+                if is_segment:
+                    for track_id in state.all_ids:
+                        state.flush_mask_buffer(track_id)
+                state.save_tracking_csvs()
+
+                # Save a json file with all metadata / parameters used
+                # for prediction
+                metadata_to_save = {
+                    "octron_version": octron_version,
+                    "prediction_start_timestamp": datetime.fromtimestamp(
+                        video_prediction_start
+                    ).isoformat(),
+                    "prediction_end_timestamp": datetime.now().isoformat(),
+                    "model_classes": {
+                        str(k): v for k, v in model.names.items()
+                    },
+                    "video_info": {
+                        "original_video_name": video_name,
+                        "original_video_path": video_dict["video_file_path"],
+                        "num_frames_original": video_dict["num_frames"],
+                        "num_frames_analyzed": video_dict[
+                            "num_frames_analyzed"
+                        ],
+                        "height": state.video_dict["height"],
+                        "width": state.video_dict["width"],
+                        "mosaic_height": video_dict["height"],
+                        "mosaic_width": video_dict["width"],
+                        "fps_original": video_dict.get("fps", "unknown"),
+                        # FastVideoReader uses read_format='rgb24';
+                        # intensity columns -0, -1, -2 map to R, G, B
+                        "channel_order": "rgb",
+                    },
+                    "camera": state.camera.to_dict() if multi_camera else None,
+                    "prediction_parameters": {
+                        "model_path": meta_model_path_str,
+                        "model_task": model_task,
+                        "model_imgsz": imgsz,
+                        "model_retina_masks": retina_masks,
+                        "region_properties": list(region_properties)
+                        if region_properties
+                        else None,
+                        "extra_properties": [
+                            fn.__name__ for fn in extra_properties
+                        ]
+                        if extra_properties
+                        else None,
+                        "device": device,
+                        "tracker_name": tracker_name,
+                        "skip_frames": skip_frames,
+                        "one_object_per_label": one_object_per_label,
+                        "iou_thresh": iou_thresh,
+                        "conf_thresh": conf_thresh,
+                        "opening_radius": opening_radius,
+                        "overwrite_existing_predictions": overwrite,
+                    },
+                    "tracker_configuration": {
+                        "tracker_type": tracker_config[tracker_id][
+                            "tracker_type"
+                        ],
+                        "is_reid": is_reid,
+                        "reid_model": tracker_config[tracker_id]["reid_model"]
+                        if is_reid
+                        else None,
+                        # All parameters from evolve_param_dict
+                        "parameters": custom_tracker_params,
+                    },
+                    "identity": identity_meta,
+                    "identity_classes": identity_clf.classes
+                    if identity_clf is not None
+                    else None,
+                    "original_model_training_args": model_args
+                    if model_args is not None
+                    else "Model args not found",
+                }
+                json_meta_path = state.save_dir / "prediction_metadata.json"
+                with open(json_meta_path, "w") as f:
+                    json.dump(metadata_to_save, f, indent=4)
+                logger.info(
+                    f"Saved prediction metadata to {json_meta_path.as_posix()}"
+                )
 
             # When caching, close the zarr stores and move the completed video
             # folder to its final destination before reporting it, so consumers
             # (e.g. the GUI) load results from the final location.
             reported_save_dir = save_dir
             if _cache_root is not None:
-                if is_segment and prediction_store is not None:
-                    with contextlib.suppress(Exception):
-                        prediction_store.close()
-                mask_stores.clear()
-                prediction_store = None
+                for state in states.values():
+                    state.close()
+                states.clear()
                 gc.collect()
                 move_prediction_folder(save_dir, final_save_dir)
                 reported_save_dir = final_save_dir
@@ -3691,6 +3955,9 @@ class YOLO_octron:
                 "stage": "video_complete",
                 "video_name": video_name,
                 "save_dir": reported_save_dir,
+                "camera_dirs": [reported_save_dir / cam.name for cam in layout]
+                if multi_camera
+                else [reported_save_dir],
             }
 
         # Clean up the local cache root (each completed video was already moved

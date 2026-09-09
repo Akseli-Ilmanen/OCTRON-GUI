@@ -32,6 +32,7 @@ octron_version = __version__
 import napari
 import numpy as np
 import zarr
+from napari.layers.base._base_constants import ActionType
 from napari.qt import create_worker
 from napari.utils import DirectLabelColormap
 from napari.utils.notifications import (
@@ -57,9 +58,13 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+# Multi-camera (mosaic) layout
+from octron.cameras import CAMERAS_FILENAME, CameraLayout
+
 # Custom dialog boxes
 from octron.gui_dialog_elements import (
     add_new_label_dialog,
+    name_cameras_dialog,
     remove_label_dialog,
 )
 
@@ -68,6 +73,9 @@ from octron.gui_elements import octron_gui_elements
 from octron.gui_tables import ExistingDataTable
 from octron.sam_octron.helpers.build_sam2_octron import build_sam2_octron
 from octron.sam_octron.helpers.build_sam3_octron import build_sam3_octron
+from octron.sam_octron.helpers.mosaic_predictor import (
+    MosaicPredictor,
+)
 from octron.sam_octron.helpers.sam2_checks import check_sam2_models
 from octron.sam_octron.helpers.sam3_checks import check_sam3_models
 
@@ -117,6 +125,9 @@ if app is not None:
     # This is a hack to get the style to look similar on darwin and
     # windows systems for the ToolBox widget
     app.setStyle(QStyleFactory.create("Fusion"))
+
+# Name of the napari Shapes layer holding the mosaic sub-camera rectangles
+CAMERAS_LAYER_NAME = "cameras"
 
 
 class octron_widget(QWidget):
@@ -268,6 +279,11 @@ class octron_widget(QWidget):
         self.create_project_btn.clicked.connect(
             self.open_project_folder_dialog
         )
+        # ... cameras (mosaic sub-camera layout)
+        self.draw_cameras_btn.clicked.connect(self.on_draw_cameras)
+        self.name_cameras_btn.clicked.connect(self.on_name_cameras)
+        self.save_cameras_btn.clicked.connect(self.on_save_cameras)
+        self.load_cameras_btn.clicked.connect(self.on_load_cameras)
         # ... SAM2 and annotations
         self.load_sam_model_btn.clicked.connect(self.load_model)
         self.create_annotation_layer_btn.clicked.connect(
@@ -651,6 +667,8 @@ class octron_widget(QWidget):
                 self.predictor.reset_state()
         except Exception as e:
             logger.warning(f"Warning: reset_state during cleanup failed: {e}")
+        if isinstance(self.predictor, MosaicPredictor):
+            self.predictor = self.predictor.predictor
 
         # For SAM3_semantic_octron, also release the detector model
         from octron.sam_octron.helpers.sam3_octron import (
@@ -1439,8 +1457,12 @@ class octron_widget(QWidget):
             # 2. The layer is an annotation layer
             # 3. The layer is a video layer
 
+            # 0. Cameras layer (mosaic sub-camera rectangles): not part
+            #    of the object organizer, nothing else to clean up.
+            if self.layer_to_remove.metadata.get("_cameras"):
+                pass
             # 1. Mask layer
-            if (
+            elif (
                 self.layer_to_remove._basename() == "Labels"
                 and "mask" in self.layer_to_remove.metadata["_name"]
             ):
@@ -1494,6 +1516,7 @@ class octron_widget(QWidget):
                 self.video_layer = None
                 self.current_video_hash = None
                 self.video_zarr = None
+                self.video_zarr_cameras = None
                 if (
                     hasattr(self, "prefetcher_worker")
                     and self.prefetcher_worker is not None
@@ -1759,6 +1782,389 @@ class octron_widget(QWidget):
         add_layer(
             FastVideoReader(video_path, read_format="rgb24"), **layer_dict
         )
+        # consolidate_layers() (layer-inserted callback) has now set
+        # self.video_layer / self.project_path_video. If this video
+        # already has a cameras.json, overlay its rectangles.
+        self._restore_cameras_layer()
+
+    ###########################################################
+    # Cameras (multi-camera mosaic layout)
+    # One rectangle per sub-camera, drawn on a napari Shapes layer named
+    # CAMERAS_LAYER_NAME and persisted as
+    # <project>/<video_hash8>/cameras.json (octron.cameras.CameraLayout).
+    ###########################################################
+
+    def _cameras_json_path(self):
+        """Return the cameras.json path of the current video (or None)."""
+        if self.project_path_video is None:
+            return None
+        return self.project_path_video / CAMERAS_FILENAME
+
+    def _cameras_layer(self):
+        """Return the existing 'cameras' Shapes layer, or None."""
+        for layer in self._viewer.layers:
+            if layer._basename() == "Shapes" and layer.metadata.get(
+                "_cameras"
+            ):
+                return layer
+        return None
+
+    def _add_cameras_layer(self, rectangles=None, names=None):
+        """(Re)create the 'cameras' Shapes layer.
+
+        Any existing cameras layer is removed first.
+
+        Parameters
+        ----------
+        rectangles : list of (4, 2) arrays, optional
+            Rectangle corners as (row, col). None -> empty layer.
+        names : list of str, optional
+            One name per rectangle.
+
+        Returns
+        -------
+        napari.layers.Shapes
+
+        """
+        old_layer = self._cameras_layer()
+        if old_layer is not None:
+            self._viewer.layers.remove(old_layer)
+
+        if rectangles:
+            data = [np.asarray(r, dtype=float) for r in rectangles]
+            names = list(names) if names is not None else []
+            names += [""] * (len(data) - len(names))
+            features = {"name": np.array(names[: len(data)], dtype=str)}
+        else:
+            data = None
+            features = {"name": np.array([], dtype=str)}
+
+        layer = self._viewer.add_shapes(
+            data,
+            ndim=2,
+            name=CAMERAS_LAYER_NAME,
+            shape_type="rectangle",
+            edge_width=3,
+            edge_color="yellow",
+            face_color=[0, 0, 0, 0],
+            features=features,
+            feature_defaults={"name": ""},
+            text={
+                "string": "{name}",
+                "color": "yellow",
+                "size": 12,
+                "anchor": "upper_left",
+                "translation": [8, 8],
+            },
+            metadata={"_name": CAMERAS_LAYER_NAME, "_cameras": True},
+        )
+        # Give freshly drawn rectangles a default name (cam0, cam1, ...)
+        layer.events.data.connect(self._on_cameras_data_changed)
+        self._fill_camera_names(layer)
+        return layer
+
+    @staticmethod
+    def _camera_names(layer):
+        """Return the camera names stored in the layer features."""
+        if "name" not in layer.features.columns:
+            return [""] * layer.nshapes
+        names = []
+        for n in layer.features["name"].tolist():
+            if n is None or (isinstance(n, float) and np.isnan(n)):
+                names.append("")
+            else:
+                names.append(str(n).strip())
+        return names
+
+    def _fill_camera_names(self, layer):
+        """Replace empty camera names with the next free ``cam<i>``."""
+        names = self._camera_names(layer)
+        used = {n for n in names if n}
+        k = 0
+        for i, n in enumerate(names):
+            if n:
+                continue
+            while f"cam{k}" in used:
+                k += 1
+            names[i] = f"cam{k}"
+            used.add(names[i])
+        if names != self._camera_names(layer):
+            self._set_camera_names(layer, names)
+
+    @staticmethod
+    def _set_camera_names(layer, names):
+        """Write ``names`` into the layer's 'name' feature column."""
+        features = layer.features.copy()
+        features["name"] = np.array(list(names), dtype=str)
+        layer.features = features
+        # napari derives feature_defaults from the last row when features
+        # are set; keep the default blank so a newly drawn rectangle is
+        # recognised as unnamed (and gets the next free cam<i>).
+        layer.feature_defaults = {"name": ""}
+
+    def _on_cameras_data_changed(self, event):
+        """Name newly drawn camera rectangles (layer data callback)."""
+        if getattr(event, "action", None) != ActionType.ADDED:
+            return
+        layer = event.source
+        try:
+            self._fill_camera_names(layer)
+        except Exception as e:
+            logger.warning(f"Could not name new camera rectangle: {e}")
+
+    def _build_camera_layout(self, layer):
+        """Build and validate a CameraLayout from the cameras layer."""
+        metadata = self.video_layer.metadata
+        non_rects = [
+            (i, str(t))
+            for i, t in enumerate(layer.shape_type)
+            if str(t) != "rectangle"
+        ]
+        if non_rects:
+            logger.warning(
+                "Cameras layer contains non-rectangle shapes; using their "
+                f"bounding boxes: {non_rects}"
+            )
+        layout = CameraLayout.from_rectangles(
+            [np.asarray(d, dtype=float)[:, -2:] for d in layer.data],
+            frame_width=int(metadata["width"]),
+            frame_height=int(metadata["height"]),
+            names=self._camera_names(layer),
+        )
+        video_file_path = metadata.get("video_file_path")
+        layout.video_file_path = (
+            Path(video_file_path).as_posix() if video_file_path else None
+        )
+        layout.video_hash = metadata.get("hash")
+        layout.validate()
+        return layout
+
+    def _show_camera_layout(self, layout):
+        """Recreate the cameras layer from a CameraLayout."""
+        rectangles = [
+            np.array(
+                [
+                    [cam.y_min, cam.x_min],
+                    [cam.y_min, cam.x_max],
+                    [cam.y_max, cam.x_max],
+                    [cam.y_max, cam.x_min],
+                ],
+                dtype=float,
+            )
+            for cam in layout.cameras
+        ]
+        names = [cam.name for cam in layout.cameras]
+        layer = self._add_cameras_layer(rectangles, names)
+        layer.mode = "pan_zoom"
+        # Keep the video layer active so nothing is drawn by accident
+        if self.video_layer is not None:
+            self._viewer.layers.selection.active = self.video_layer
+        return layer
+
+    def _restore_cameras_layer(self):
+        """Overlay the video's cameras.json (if any) as a Shapes layer."""
+        cameras_path = self._cameras_json_path()
+        if (
+            self.video_layer is None
+            or cameras_path is None
+            or not cameras_path.exists()
+        ):
+            return
+        try:
+            layout = CameraLayout.load(cameras_path)
+            layout.validate()
+        except Exception as e:
+            show_warning(f"Could not restore cameras from {cameras_path}: {e}")
+            return
+        self._show_camera_layout(layout)
+        logger.info(
+            f"Restored {len(layout.cameras)} camera(s) from {cameras_path}"
+        )
+
+    def on_draw_cameras(self):
+        """Add (or select) the cameras layer and enter rectangle mode."""
+        if self.video_layer is None:
+            show_warning("Load a video first, then draw the cameras.")
+            return
+        layer = self._cameras_layer()
+        if layer is None:
+            layer = self._add_cameras_layer()
+        self._viewer.layers.selection.active = layer
+        layer.mode = "add_rectangle"
+        show_info(
+            "Draw one rectangle per camera. Then 'Name…' (optional) "
+            "and 'Save'."
+        )
+
+    def on_name_cameras(self):
+        """Open a dialog to rename the drawn camera rectangles."""
+        layer = self._cameras_layer()
+        if layer is None or layer.nshapes == 0:
+            show_warning("No camera rectangles drawn yet. Click 'Draw'.")
+            return
+        dialog = name_cameras_dialog(self, self._camera_names(layer))
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self._set_camera_names(layer, dialog.names())
+        self._fill_camera_names(layer)  # fill any blanks with cam<i>
+
+    def on_save_cameras(self):
+        """Save the drawn camera rectangles to the video's cameras.json."""
+        cameras_path = self._cameras_json_path()
+        if self.video_layer is None or cameras_path is None:
+            show_warning("Load a project and a video before saving cameras.")
+            return
+        layer = self._cameras_layer()
+        if layer is None or layer.nshapes == 0:
+            show_warning("No camera rectangles drawn yet. Click 'Draw'.")
+            return
+        try:
+            self._fill_camera_names(layer)
+            layout = self._build_camera_layout(layer)
+            layout.save(cameras_path, overwrite=True)
+        except Exception as e:
+            show_error(f"Could not save cameras: {e}")
+            return
+        show_info(
+            f"Saved {len(layout.cameras)} camera(s) "
+            f"({', '.join(layout.names)}) to {cameras_path}"
+        )
+        if getattr(self.predictor, "is_initialized", False):
+            show_warning(
+                "SAM is already running on the full frame. Reload the "
+                "video to segment each camera at full resolution."
+            )
+
+    def on_load_cameras(self):
+        """Load a cameras.json, copy it to the video folder and show it."""
+        cameras_path = self._cameras_json_path()
+        if self.video_layer is None or cameras_path is None:
+            show_warning("Load a project and a video before loading cameras.")
+            return
+        start_dir = (
+            self.project_path.as_posix()
+            if self.project_path
+            else str(Path.home())
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load cameras.json", start_dir, "JSON files (*.json)"
+        )
+        if not file_path:
+            return
+        file_path = Path(file_path)
+        try:
+            layout = CameraLayout.load(file_path)
+            layout.validate()
+            metadata = self.video_layer.metadata
+            width, height = int(metadata["width"]), int(metadata["height"])
+            if (layout.frame_width, layout.frame_height) != (width, height):
+                raise ValueError(
+                    f"Frame size in file ({layout.frame_width} x "
+                    f"{layout.frame_height}) does not match the video "
+                    f"({width} x {height})."
+                )
+            if file_path.resolve() != cameras_path.resolve():
+                cameras_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file_path, cameras_path)
+        except Exception as e:
+            show_error(f"Could not load cameras from {file_path}: {e}")
+            return
+        self._show_camera_layout(layout)
+        show_info(
+            f"Loaded {len(layout.cameras)} camera(s) "
+            f"({', '.join(layout.names)}); copied to {cameras_path}"
+        )
+        if getattr(self, "video_zarr_cameras", None) is None:
+            show_warning(
+                "Reload the video (remove and drop it again) so SAM "
+                "segments each camera at full resolution."
+            )
+
+    def _mosaic_layout_for_sam(self):
+        """Return the camera layout to segment per camera, or None.
+
+        Per-camera SAM is used when the current video has a saved
+        ``cameras.json`` with more than one camera and the predictor is
+        not the SAM3 semantic detector (which has no per-video state).
+        """
+        from octron.sam_octron.helpers.sam3_octron import SAM3_semantic_octron
+
+        cameras_path = self._cameras_json_path()
+        if cameras_path is None or not cameras_path.exists():
+            return None
+        base = (
+            self.predictor.predictor
+            if isinstance(self.predictor, MosaicPredictor)
+            else self.predictor
+        )
+        if isinstance(base, SAM3_semantic_octron):
+            return None
+        try:
+            layout = CameraLayout.load(cameras_path)
+            layout.validate()
+        except Exception as e:
+            logger.warning(f"Ignoring {cameras_path}: {e}")
+            return None
+        if len(layout) < 2 or layout.is_single_full_frame():
+            return None
+        if self.video_layer is not None:
+            h = self.video_layer.metadata["height"]
+            w = self.video_layer.metadata["width"]
+            if (layout.frame_height, layout.frame_width) != (h, w):
+                logger.warning(
+                    f"{cameras_path.name} is for {layout.frame_width}x"
+                    f"{layout.frame_height}, video is {w}x{h}; ignoring."
+                )
+                return None
+        if not getattr(self, "video_zarr_cameras", None):
+            return None
+        return layout
+
+    def _init_camera_image_zarrs(self, num_frames, height, width):
+        """Create one resized image store per camera for mosaic SAM."""
+        self.video_zarr_cameras = None
+        cameras_path = self._cameras_json_path()
+        if cameras_path is None or not cameras_path.exists():
+            return
+        try:
+            layout = CameraLayout.load(cameras_path)
+        except Exception as e:
+            logger.warning(f"Ignoring {cameras_path}: {e}")
+            return
+        if len(layout) < 2 or layout.is_single_full_frame():
+            return
+        stores = {}
+        for cam in layout:
+            zarr_path = self.project_path_video / f"video data {cam.name}.zarr"
+            store, status = None, False
+            if zarr_path.exists():
+                store, status = load_image_zarr(
+                    zarr_path,
+                    num_frames=num_frames,
+                    image_height=height,
+                    image_width=width,
+                    chunk_size=self.chunk_size,
+                    num_ch=3,
+                    video_hash_abrrev=self.current_video_hash,
+                )
+            if not status:
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
+                store = create_image_zarr(
+                    zarr_path,
+                    num_frames=num_frames,
+                    image_height=height,
+                    image_width=width,
+                    chunk_size=self.chunk_size,
+                    num_ch=3,
+                    video_hash_abbrev=self.current_video_hash,
+                )
+            stores[cam.name] = store
+            self.all_zarrs.append(store)
+        self.video_zarr_cameras = stores
+        logger.info(
+            f"Per-camera SAM image stores ready for {', '.join(stores)}"
+        )
 
     def init_sam2_model(self):
         """Initialize the SAM2 model for the current session.
@@ -1784,10 +2190,21 @@ class octron_widget(QWidget):
         #    layer is found
         # -> on_changed_layer() and load_sam2model() take care of this
         if not self.predictor.is_initialized:
-            self.predictor.init_state(
-                video_data=self.video_layer.data,
-                zarr_store=self.video_zarr,
-            )
+            layout = self._mosaic_layout_for_sam()
+            if layout is not None:
+                # Mosaic video: one SAM state per camera so every camera
+                # is encoded at full resolution (see mosaic_predictor).
+                if not isinstance(self.predictor, MosaicPredictor):
+                    self.predictor = MosaicPredictor(self.predictor, layout)
+                self.predictor.init_state(
+                    video_data=self.video_layer.data,
+                    zarr_stores=self.video_zarr_cameras,
+                )
+            else:
+                self.predictor.init_state(
+                    video_data=self.video_layer.data,
+                    zarr_store=self.video_zarr,
+                )
             self.hard_reset_layer_btn.setEnabled(True)
             self.predictor.is_initialized = True
 
@@ -1906,6 +2323,9 @@ class octron_widget(QWidget):
 
         # Add to list of zarrs for cleanup upon closing
         self.all_zarrs.append(self.video_zarr)
+        self._init_camera_image_zarrs(
+            num_frames, resized_height, resized_width
+        )
         # Set up thread worker to deal with prefetching batches of images
         self.prefetcher_worker = create_worker(
             self.sam_octron_callbacks.prefetch_images

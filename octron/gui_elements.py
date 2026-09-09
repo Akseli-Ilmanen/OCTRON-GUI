@@ -290,9 +290,13 @@ class octron_gui_elements(QWidget):
             self.octron.project_video_drop_groupbox.sizePolicy().hasHeightForWidth()
         )
         self.octron.project_video_drop_groupbox.setSizePolicy(sizePolicy2)
-        self.octron.project_video_drop_groupbox.setMinimumSize(QSize(400, 100))
-        self.octron.project_video_drop_groupbox.setMaximumSize(QSize(400, 100))
-        self.octron.horizontalLayout = QHBoxLayout(
+        # The groupbox holds the mp4 drop area and, below it, a row of
+        # buttons for the multi-camera (mosaic) layout tool. It is a bit
+        # taller than in the Qt-Designer file; the "Existing data" table
+        # below is shrunk by the same amount to keep the tab height.
+        self.octron.project_video_drop_groupbox.setMinimumSize(QSize(400, 135))
+        self.octron.project_video_drop_groupbox.setMaximumSize(QSize(400, 135))
+        self.octron.horizontalLayout = QVBoxLayout(
             self.octron.project_video_drop_groupbox
         )
         self.octron.horizontalLayout.setSpacing(9)
@@ -307,6 +311,86 @@ class octron_gui_elements(QWidget):
 
         self.octron.horizontalLayout.addWidget(
             self.octron.video_file_drop_widget
+        )
+
+        # --- Cameras (mosaic sub-camera rectangles) ---------------------
+        # Added programmatically (not part of the Qt-Designer .ui file).
+        self.octron.cameras_horizontalLayout = QHBoxLayout()
+        self.octron.cameras_horizontalLayout.setSpacing(9)
+        self.octron.cameras_horizontalLayout.setObjectName(
+            "cameras_horizontalLayout"
+        )
+        self.octron.cameras_horizontalLayout.setContentsMargins(0, 0, 0, 0)
+        self.octron.cameras_label = QLabel(
+            self.octron.project_video_drop_groupbox
+        )
+        self.octron.cameras_label.setObjectName("cameras_label")
+        self.octron.cameras_label.setText("Cameras")
+        self.octron.cameras_label.setToolTip(
+            "Multi-camera mosaic videos: draw one rectangle per "
+            "sub-camera and save the layout as cameras.json next to the "
+            "video's object_organizer.json"
+        )
+        self.octron.cameras_horizontalLayout.addWidget(
+            self.octron.cameras_label
+        )
+        self.octron.draw_cameras_btn = QPushButton(
+            self.octron.project_video_drop_groupbox
+        )
+        self.octron.draw_cameras_btn.setObjectName("draw_cameras_btn")
+        self.octron.draw_cameras_btn.setMinimumSize(QSize(72, 25))
+        self.octron.draw_cameras_btn.setMaximumSize(QSize(72, 25))
+        self.octron.draw_cameras_btn.setText("✎ Draw")
+        self.octron.draw_cameras_btn.setToolTip(
+            "Add (or select) the 'cameras' shapes layer and draw one "
+            "rectangle per sub-camera"
+        )
+        self.octron.cameras_horizontalLayout.addWidget(
+            self.octron.draw_cameras_btn
+        )
+        self.octron.name_cameras_btn = QPushButton(
+            self.octron.project_video_drop_groupbox
+        )
+        self.octron.name_cameras_btn.setObjectName("name_cameras_btn")
+        self.octron.name_cameras_btn.setMinimumSize(QSize(72, 25))
+        self.octron.name_cameras_btn.setMaximumSize(QSize(72, 25))
+        self.octron.name_cameras_btn.setText("Name…")
+        self.octron.name_cameras_btn.setToolTip(
+            "Rename the drawn camera rectangles"
+        )
+        self.octron.cameras_horizontalLayout.addWidget(
+            self.octron.name_cameras_btn
+        )
+        self.octron.save_cameras_btn = QPushButton(
+            self.octron.project_video_drop_groupbox
+        )
+        self.octron.save_cameras_btn.setObjectName("save_cameras_btn")
+        self.octron.save_cameras_btn.setMinimumSize(QSize(72, 25))
+        self.octron.save_cameras_btn.setMaximumSize(QSize(72, 25))
+        self.octron.save_cameras_btn.setText("Save")
+        self.octron.save_cameras_btn.setToolTip(
+            "Save the camera rectangles to cameras.json in the video's "
+            "project folder"
+        )
+        self.octron.cameras_horizontalLayout.addWidget(
+            self.octron.save_cameras_btn
+        )
+        self.octron.load_cameras_btn = QPushButton(
+            self.octron.project_video_drop_groupbox
+        )
+        self.octron.load_cameras_btn.setObjectName("load_cameras_btn")
+        self.octron.load_cameras_btn.setMinimumSize(QSize(72, 25))
+        self.octron.load_cameras_btn.setMaximumSize(QSize(72, 25))
+        self.octron.load_cameras_btn.setText("Load…")
+        self.octron.load_cameras_btn.setToolTip(
+            "Load a cameras.json file, copy it into the video's project "
+            "folder and show the rectangles"
+        )
+        self.octron.cameras_horizontalLayout.addWidget(
+            self.octron.load_cameras_btn
+        )
+        self.octron.horizontalLayout.addLayout(
+            self.octron.cameras_horizontalLayout
         )
 
         self.octron.project_vertical_layout.addWidget(
@@ -324,11 +408,13 @@ class octron_gui_elements(QWidget):
             self.octron.project_existing_data_groupbox.sizePolicy().hasHeightForWidth()
         )
         self.octron.project_existing_data_groupbox.setSizePolicy(sizePolicy2)
+        # 185 (not 220 as in the .ui file) to make room for the camera
+        # buttons in the video groupbox above.
         self.octron.project_existing_data_groupbox.setMinimumSize(
-            QSize(400, 220)
+            QSize(400, 185)
         )
         self.octron.project_existing_data_groupbox.setMaximumSize(
-            QSize(400, 220)
+            QSize(400, 185)
         )
         self.octron.horizontalLayout_9 = QHBoxLayout(
             self.octron.project_existing_data_groupbox
@@ -340,8 +426,8 @@ class octron_gui_elements(QWidget):
             self.octron.project_existing_data_groupbox
         )
         self.octron.existing_data_table.setObjectName("existing_data_table")
-        self.octron.existing_data_table.setMinimumSize(QSize(380, 180))
-        self.octron.existing_data_table.setMaximumSize(QSize(380, 180))
+        self.octron.existing_data_table.setMinimumSize(QSize(380, 145))
+        self.octron.existing_data_table.setMaximumSize(QSize(380, 145))
         self.octron.existing_data_table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.DefaultContextMenu
         )

@@ -131,6 +131,15 @@ def _coerce_positive_int(value):
     return number
 
 
+def _coerce_color_mode(value):
+    """Coerce the object colour mode to 'label' or 'individual'."""
+    text = str(value).strip().lower()
+    allowed = ("label", "individual")
+    if text not in allowed:
+        raise ValueError(f"must be one of {', '.join(allowed)}")
+    return text
+
+
 def _coerce_device(value):
     """Coerce a compute-device setting to one of auto/cpu/cuda/mps."""
     text = str(value).strip().lower()
@@ -233,6 +242,20 @@ SETTINGS: "tuple[SettingSpec, ...]" = (
             "when --buffer-size is omitted, and by the GUI."
         ),
         coerce=_coerce_positive_int,
+    ),
+    SettingSpec(
+        key="object_color_mode",
+        default="label",
+        kind="choice",
+        choices=("label", "individual"),
+        description=(
+            "How annotation colours are picked in the GUI. 'label': all "
+            "suffixes of a label share one colour family (shades of one "
+            "hue). 'individual': every label + suffix gets a maximally "
+            "different colour, useful when individuals of one species "
+            "(e.g. 'bird male', 'bird female') must be told apart."
+        ),
+        coerce=_coerce_color_mode,
     ),
 )
 
@@ -517,6 +540,11 @@ def get_split_seed() -> int:
 def get_split_buffer() -> int:
     """Return the buffer (frames dropped at split block boundaries)."""
     return get_value("split_buffer")
+
+
+def get_object_color_mode() -> str:
+    """Return the annotation colour mode ('label' or 'individual')."""
+    return get_value("object_color_mode")
 
 
 def get_device() -> str:

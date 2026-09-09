@@ -133,3 +133,49 @@ class remove_video_dialog(QDialog):
 
         self.remove_btn.clicked.connect(self.accept)
         self.cancel_btn.clicked.connect(self.reject)
+
+
+class name_cameras_dialog(QDialog):
+    """Let the user (re)name the camera rectangles of a mosaic video.
+
+    One QLineEdit per rectangle, listed in drawing order.
+    """
+
+    def __init__(self, parent: QWidget, names: list):
+        """Initialize the dialog with the current camera names.
+
+        Parameters
+        ----------
+        parent : QWidget
+            That is the octron main GUI
+        names : list
+            Current camera names, one per rectangle (drawing order)
+
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Name cameras")
+        self.setMinimumWidth(300)
+
+        self.name_edits = []
+        layout = QGridLayout()
+        for i, name in enumerate(names):
+            edit = QLineEdit()
+            edit.setObjectName(f"camera_name_{i}")
+            edit.setMaxLength(100)
+            edit.setText(str(name) if name is not None else "")
+            layout.addWidget(QLabel(f"Rectangle {i}:"), i, 0)
+            layout.addWidget(edit, i, 1)
+            self.name_edits.append(edit)
+
+        self.ok_btn = QPushButton("OK")
+        self.cancel_btn = QPushButton("Cancel")
+        layout.addWidget(self.ok_btn, len(names), 0)
+        layout.addWidget(self.cancel_btn, len(names), 1)
+        self.setLayout(layout)
+
+        self.ok_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+    def names(self) -> list:
+        """Return the (stripped) names entered by the user, in order."""
+        return [edit.text().strip() for edit in self.name_edits]

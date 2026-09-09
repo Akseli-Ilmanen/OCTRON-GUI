@@ -1,5 +1,11 @@
 #### Changelog
 
+## Unreleased
+- Multi-camera mosaics: `cameras.json` per video (drawn in the GUI or applied with `octron cameras`); `octron predict` assigns detections to cameras by box centre and tracks each camera separately into `<output>/<camera>/`.
+- Identity classifier: `octron train-identity` trains a YOLO classification model on `(label, suffix)` crops; `octron predict --identity` adds `identity`, `identity_conf` and `identity_prob_*` columns to the tracking CSVs.
+- `octron link`: exact per-camera exclusivity assignment of identities to tracklets (`scipy.optimize.milp`), with `--global` for non-overlapping rigs and review flags; `YOLO_results.get_identity_assignment()`.
+- See `MULTICAMERA.md` for the full workflow.
+
 ## vers. 0.2
 - Date: 2026-03-06
 - 98 commits since v0.1

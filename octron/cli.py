@@ -8,9 +8,13 @@ Subcommands
   gpu-test    Check GPU availability
   config      View/edit config.yaml settings
               (init/list/get/set/path/edit)
+  cameras     Validate/show a cameras.json, or distribute it to a
+              project and/or video sibling files
   split       Prepare and export train/val/test data from an OCTRON project
   train       Prepare training data and run YOLO model training
   predict     Run YOLO prediction and tracking on one or more videos
+  link        Assign identities to tracklets across one or more camera
+              folders (post-hoc exclusivity pass on identity_prob_* scores)
   dump-tracker-config  Print a tracker's default config YAML (edit,
                         then pass via --tracker-config)
   render      Render annotated video(s) from prediction output
@@ -251,6 +255,84 @@ def gpu_test():
     from octron.test_gpu import check_gpu_access
 
     check_gpu_access()
+
+
+@app.command()
+def cameras(
+    cameras_json: Path = typer.Argument(
+        ..., help="Path to a cameras.json file describing the mosaic layout."
+    ),
+    project_path: Path | None = typer.Option(
+        None,
+        "--project",
+        help=(
+            "OCTRON project directory. The file is copied to "
+            "<project>/<subfolder>/cameras.json for every subfolder "
+            "containing an object_organizer.json."
+        ),
+    ),
+    video: list[Path] = typer.Option(
+        [],
+        "--video",
+        help=(
+            "Video file(s) to copy the cameras.json alongside as "
+            "<video_stem>_cameras.json. Repeatable."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite existing destination cameras.json files.",
+    ),
+    show: bool = typer.Option(
+        False,
+        "--show",
+        help=(
+            "Only validate CAMERAS_JSON and print its cameras (name, "
+            "bounds, size) and any overlap warnings; nothing is written."
+        ),
+    ),
+):
+    """Validate a cameras.json, or distribute it to a project/videos."""
+    from octron.cameras import CameraLayout, apply_cameras
+
+    layout = CameraLayout.load(cameras_json)
+    layout.validate()
+
+    if show:
+        header = (
+            f"{'name':<12}{'x_min':>8}{'y_min':>8}{'x_max':>8}"
+            f"{'y_max':>8}{'width':>8}{'height':>8}"
+        )
+        typer.echo(header)
+        for cam in layout:
+            typer.echo(
+                f"{cam.name:<12}{cam.x_min:>8}{cam.y_min:>8}"
+                f"{cam.x_max:>8}{cam.y_max:>8}{cam.width:>8}{cam.height:>8}"
+            )
+        return
+
+    if project_path is None and not video:
+        typer.echo(
+            "Error: pass --project and/or --video, or use --show.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    written = apply_cameras(
+        cameras_json,
+        project_path=project_path,
+        videos=video,
+        force=force,
+    )
+    if written:
+        typer.echo("Wrote cameras.json to:")
+        for path in written:
+            typer.echo(f"  {Path(path).as_posix()}")
+    else:
+        typer.echo(
+            "No cameras.json files written (all skipped or none matched)."
+        )
 
 
 @app.command()
@@ -501,6 +583,33 @@ def predict(
             "'prediction_cache_dir'; if neither is set, caching is off."
         ),
     ),
+    cameras: Path | None = typer.Option(
+        None,
+        "--cameras",
+        help=(
+            "cameras.json with the sub-camera rectangles of a mosaic "
+            "video (see 'octron cameras'). Each camera is tracked "
+            "separately and written to <output>/<camera>/. Default: a "
+            "sibling <stem>_cameras.json next to the video, if present."
+        ),
+    ),
+    identity: Path | None = typer.Option(
+        None,
+        "--identity",
+        help=(
+            "Identity classifier weights (best.pt from 'octron "
+            "train-identity'). Adds identity/identity_conf/"
+            "identity_prob_* columns to the tracking CSVs."
+        ),
+    ),
+    identity_imgsz: int = typer.Option(
+        224, "--identity-imgsz", help="Identity classifier input size."
+    ),
+    identity_padding: float = typer.Option(
+        0.1,
+        "--identity-padding",
+        help="Crop padding for the identity classifier (match training).",
+    ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
     # Validate --detailed up front (before any heavy import) so a typo
@@ -531,6 +640,117 @@ def predict(
         region_properties=region_properties,
         output_dir=output_dir,
         local_cache_dir=local_cache_dir,
+        cameras=cameras,
+        identity_weights=identity,
+        identity_imgsz=identity_imgsz,
+        identity_padding=identity_padding,
+    )
+
+
+@app.command("train-identity")
+def train_identity(
+    project_path: Path = typer.Argument(
+        ..., help="Path to the OCTRON project directory."
+    ),
+    model: str = typer.Option(
+        "yolo11n-cls",
+        help="YOLO classification model name (e.g. yolo11n-cls) or .pt.",
+    ),
+    imgsz: int = typer.Option(224, help="Classifier input size."),
+    epochs: int = typer.Option(50, help="Number of training epochs."),
+    device: Device | None = typer.Option(
+        None, help="Device to train on (default: config.yaml)."
+    ),
+    batch: int = typer.Option(-1, help="Batch size (-1: automatic)."),
+    padding: float = typer.Option(
+        0.1, help="Fractional crop padding around each mask box."
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Rebuild the crop dataset and retrain from scratch.",
+    ),
+    skip_export: bool = typer.Option(
+        False,
+        "--skip-export",
+        help="Reuse the existing crop dataset instead of re-exporting.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Train the identity classifier (label suffix as individual).
+
+    Individuals must be annotated as '<label> <suffix>' (e.g. 'bird 1',
+    'bird 2'). The detector learns the label; this classifier learns
+    the suffix from crops of the annotated masks. Use the result with
+    'octron predict --identity' and 'octron link'.
+    """
+    from octron.tools.identity import run_train_identity
+
+    run_train_identity(
+        project_path=project_path,
+        model=model,
+        imgsz=imgsz,
+        epochs=epochs,
+        device=device.value if device is not None else None,
+        batch=batch,
+        padding=padding,
+        overwrite=overwrite,
+        skip_export=skip_export,
+        verbose=verbose,
+    )
+
+
+@app.command()
+def link(
+    folders: list[Path] = typer.Argument(
+        ...,
+        help=(
+            "One or more prediction output folders (one per camera) "
+            "containing tracklet CSVs from `octron predict`."
+        ),
+    ),
+    min_margin: float = typer.Option(
+        1.5,
+        "--min-margin",
+        help=(
+            "Flag a tracklet as 'low_margin' when its assigned "
+            "identity's score divided by the runner-up's score falls "
+            "below this ratio."
+        ),
+    ),
+    global_exclusive: bool = typer.Option(
+        False,
+        "--global",
+        help=(
+            "Forbid the same individual in two folders at the same "
+            "time (frame_idx), for synchronised multi-camera mosaics. "
+            "Default: exclusivity only within each folder."
+        ),
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help=(
+            "Overwrite existing identity_assignment.csv / "
+            "link_report.json outputs. Default: refuse if they exist."
+        ),
+    ),
+):
+    """Assign identities to tracklets across one or more camera folders.
+
+    Runs an exact post-hoc exclusivity pass over the identity classifier's
+    per-frame ``identity_prob_*`` scores: every tracklet gets at most one
+    individual, and temporally overlapping tracklets never share one.
+    Writes ``identity_assignment.csv`` and ``link_report.json`` into each
+    folder.
+    """
+    from octron.tools.link import run_link
+
+    run_link(
+        folders=folders,
+        min_margin=min_margin,
+        global_exclusive=global_exclusive,
+        overwrite=overwrite,
     )
 
 
