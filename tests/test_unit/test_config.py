@@ -224,3 +224,10 @@ def test_specs_includes_split_settings(cfg_path):
         "split_seed",
         "split_buffer",
     } <= keys
+
+
+def test_user_keys_reports_only_file_keys(cfg_path):
+    # user_keys() reflects only what's stored in config.yaml, not defaults.
+    assert config.user_keys() == set()
+    config.set_value("split_seed", 7)
+    assert config.user_keys() == {"split_seed"}

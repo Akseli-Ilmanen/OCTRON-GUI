@@ -290,6 +290,15 @@ def specs() -> "tuple[SettingSpec, ...]":
     return SETTINGS
 
 
+def user_keys() -> set:
+    """Return known setting keys explicitly stored in ``config.yaml``.
+
+    Keys absent from the file (served from their in-code default) are not
+    included. Used by ``octron config list`` to show each value's source.
+    """
+    return {key for key in _read_raw() if key in _SPECS}
+
+
 # ---------------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------------

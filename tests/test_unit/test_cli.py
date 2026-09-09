@@ -7,6 +7,7 @@ Covered subcommands and flags
 ------------------------------
 gui         --help
 gpu-test    --help; gpu-test runs (skipped if torch DLLs unavailable)
+config      --help + list/get/set/path (get/set/path use OCTRON_CONFIG_PATH)
 split       --help: --mode, --train, --val, --seed, --buffer, --prune,
                     --watershed, --dry-run
 train       --help: --model, --mode, --device, --epochs, --imagesz,
@@ -162,6 +163,75 @@ def test_train_help():
     assert "--no-prune" in out
     assert "--watershed" in out
     assert "--no-watershed" in out
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+
+def test_config_help():
+    result = runner.invoke(app, ["config", "--help"])
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    for sub in ("list", "get", "set", "path", "edit"):
+        assert sub in out
+
+
+def test_config_path_reports_location(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app, ["config", "path"], env={"OCTRON_CONFIG_PATH": str(cfg)}
+    )
+    assert result.exit_code == 0
+    assert str(cfg) in result.output
+    assert "not created yet" in result.output
+
+
+def test_config_set_and_get_roundtrip(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env = {"OCTRON_CONFIG_PATH": str(cfg)}
+    set_result = runner.invoke(
+        app, ["config", "set", "split_seed", "4242"], env=env
+    )
+    assert set_result.exit_code == 0
+    assert cfg.exists()
+    get_result = runner.invoke(app, ["config", "get", "split_seed"], env=env)
+    assert get_result.exit_code == 0
+    assert "4242" in get_result.output
+
+
+def test_config_get_unknown_key_errors(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app,
+        ["config", "get", "not_a_key"],
+        env={"OCTRON_CONFIG_PATH": str(cfg)},
+    )
+    assert result.exit_code != 0
+    assert "unknown setting" in _plain(result.output).lower()
+
+
+def test_config_set_invalid_value_errors(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app,
+        ["config", "set", "split_val_fraction", "1.5"],
+        env={"OCTRON_CONFIG_PATH": str(cfg)},
+    )
+    assert result.exit_code != 0
+
+
+def test_config_list_shows_settings_and_source(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    result = runner.invoke(
+        app, ["config", "list"], env={"OCTRON_CONFIG_PATH": str(cfg)}
+    )
+    assert result.exit_code == 0
+    out = _plain(result.output)
+    assert "split_seed" in out
+    assert "prediction_cache_dir" in out
+    assert "source: default" in out
 
 
 # ---------------------------------------------------------------------------
