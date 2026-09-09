@@ -6,7 +6,8 @@ Subcommands
 -----------
   gui         Launch the OCTRON napari GUI
   gpu-test    Check GPU availability
-  config      View/edit config.yaml settings (list/get/set/path/edit)
+  config      View/edit config.yaml settings
+              (init/list/get/set/path/edit)
   split       Prepare and export train/val/test data from an OCTRON project
   train       Prepare training data and run YOLO model training
   predict     Run YOLO prediction and tracking on one or more videos
@@ -1066,6 +1067,30 @@ def _fmt_setting(value) -> str:
     return "(unset)" if value is None or value == "" else str(value)
 
 
+@config_app.command("init")
+def config_init(
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing config.yaml."
+    ),
+):
+    """Write a commented config.yaml template (all settings + defaults).
+
+    The template is fully commented, so it documents every setting
+    without changing any built-in default until you uncomment a line.
+    """
+    from octron import config
+
+    path = config.write_template(force=force)
+    if path is None:
+        existing = config.config_path().as_posix()
+        logger.info(
+            f"config.yaml already exists at {existing}; "
+            f"use --force to overwrite."
+        )
+        return
+    logger.info(f"Wrote config template to {path.as_posix()}")
+
+
 @config_app.command("list")
 def config_list():
     """List every setting with its value, default, source and help."""
@@ -1155,8 +1180,7 @@ def config_edit():
 
     path = config.config_path()
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# OCTRON user configuration\n")
+        config.write_template()
     click.edit(filename=str(path))
 
 

@@ -40,6 +40,7 @@ Example ``config.yaml``::
 """
 
 import os
+import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -366,6 +367,58 @@ def set_value(key: str, value) -> Path:
     with open(path, "w") as f:
         f.write("# OCTRON user configuration\n")
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+    return path
+
+
+def _yaml_scalar(value) -> str:
+    """Render a default as a simple YAML scalar for the config template."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def render_template() -> str:
+    """Return a fully commented ``config.yaml`` template.
+
+    Every setting is emitted as commented-out lines (its description,
+    allowed choices where relevant, and its built-in default), so the
+    file documents the available settings and is ready to edit. It is
+    inert: an untouched template reads as an empty mapping, so all
+    built-in defaults still apply until a line is uncommented.
+    """
+    lines = [
+        "# OCTRON user configuration",
+        "#",
+        "# Uncomment and edit a line below to override the built-in default.",
+        "# Delete this file to fall back to all built-in defaults.",
+        "",
+    ]
+    for spec in SETTINGS:
+        for wrapped in textwrap.wrap(spec.description, width=74):
+            lines.append(f"# {wrapped}")
+        if spec.choices:
+            lines.append(
+                f"#   choices: {', '.join(str(c) for c in spec.choices)}"
+            )
+        lines.append(f"# {spec.key}: {_yaml_scalar(spec.default)}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def write_template(force: bool = False) -> Path | None:
+    """Write the commented template (see :func:`render_template`) to disk.
+
+    Writes to :func:`config_path`. Returns the written path, or None when
+    the file already exists and ``force`` is False (nothing is
+    overwritten). Parent directories are created as needed.
+    """
+    path = config_path()
+    if path.exists() and not force:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_template())
     return path
 
 

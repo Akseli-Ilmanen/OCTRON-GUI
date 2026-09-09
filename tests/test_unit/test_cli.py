@@ -174,8 +174,36 @@ def test_config_help():
     result = runner.invoke(app, ["config", "--help"])
     assert result.exit_code == 0
     out = _plain(result.output)
-    for sub in ("list", "get", "set", "path", "edit"):
+    for sub in ("init", "list", "get", "set", "path", "edit"):
         assert sub in out
+
+
+def test_config_init_creates_and_respects_force(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env = {"OCTRON_CONFIG_PATH": str(cfg)}
+    assert runner.invoke(app, ["config", "init"], env=env).exit_code == 0
+    assert cfg.exists()
+    # The template is inert: split_seed still reports the default.
+    assert (
+        "88"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
+    # A user override survives a plain re-init (no overwrite)...
+    runner.invoke(app, ["config", "set", "split_seed", "7"], env=env)
+    assert runner.invoke(app, ["config", "init"], env=env).exit_code == 0
+    assert (
+        "7"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
+    # ...but --force overwrites back to the template (default again).
+    assert (
+        runner.invoke(app, ["config", "init", "--force"], env=env).exit_code
+        == 0
+    )
+    assert (
+        "88"
+        in runner.invoke(app, ["config", "get", "split_seed"], env=env).output
+    )
 
 
 def test_config_path_reports_location(tmp_path):
