@@ -10,6 +10,7 @@ restriction, output files / overwrite guard, and the
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -479,3 +480,184 @@ def test_build_score_matrix_zero_for_other_label():
     )
     S = build_score_matrix([t], ["bird_1", "mouse_1"])
     assert S.tolist() == [[3.0, 0.0]]
+
+
+# ---------------------------------------------------------------------------
+# min_evidence: short / indecisive tracklets stay unassigned
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_is_best_minus_runner_up():
+    from octron.tools.link import evidence
+
+    assert evidence([9.0, 1.0]) == 8.0
+    assert evidence([5.0, 5.0, 1.0]) == 0.0
+    assert evidence([3.0]) == 3.0
+    assert evidence([]) == 0.0
+
+
+def test_min_evidence_leaves_indecisive_tracklet_unassigned(tmp_path):
+    cam = tmp_path / "cam"
+    # 20 frames at 0.55/0.45: evidence 2. 20 frames at 0.9/0.1: evidence 16.
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=1,
+        frame_idx=range(20),
+        identity_probs={"bird_1": 0.55, "bird_2": 0.45},
+    )
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=2,
+        frame_idx=range(100, 120),
+        identity_probs={"bird_1": 0.9, "bird_2": 0.1},
+    )
+    run_link([cam], min_evidence=5.0)
+    df = pd.read_csv(cam / "identity_assignment.csv", index_col="track_id")
+    assert pd.isna(df.loc[1, "identity"])
+    assert df.loc[1, "reason"] == "low_evidence"
+    assert df.loc[1, "evidence"] == pytest.approx(2.0)
+    assert df.loc[1, "flagged"]
+    assert df.loc[2, "identity"] == "bird_1"
+    assert df.loc[2, "evidence"] == pytest.approx(16.0)
+    report = json.loads((cam / "link_report.json").read_text())
+    assert report["min_evidence"] == 5.0
+    assert [f["reason"] for f in report["flagged"]] == ["low_evidence"]
+
+
+def test_min_evidence_excluded_tracklet_does_not_block_neighbour(tmp_path):
+    cam = tmp_path / "cam"
+    # Both overlap and both prefer bird_1. Without the threshold the
+    # weak one would be forced onto bird_2; with it the weak one drops
+    # out and the strong one keeps bird_1.
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=1,
+        frame_idx=range(10),
+        identity_probs={"bird_1": 0.52, "bird_2": 0.48},
+    )
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=2,
+        frame_idx=range(10),
+        identity_probs={"bird_1": 0.95, "bird_2": 0.05},
+    )
+    run_link([cam], min_evidence=3.0)
+    df = pd.read_csv(cam / "identity_assignment.csv", index_col="track_id")
+    assert pd.isna(df.loc[1, "identity"])
+    assert df.loc[2, "identity"] == "bird_1"
+
+
+# ---------------------------------------------------------------------------
+# min_overlap: tracker hand-over overlaps do not count as co-existence
+# ---------------------------------------------------------------------------
+
+
+def test_temporal_overlaps_min_overlap():
+    a = Tracklet(Path("x"), 1, "bird", np.arange(0, 100))
+    b = Tracklet(Path("x"), 2, "bird", np.arange(97, 200))  # 3 shared
+    c = Tracklet(Path("x"), 3, "bird", np.arange(50, 80))  # 30 shared with a
+    assert temporal_overlaps([a, b, c]) == [(0, 1), (0, 2)]
+    assert temporal_overlaps([a, b, c], min_overlap=10) == [(0, 2)]
+
+
+def test_min_overlap_lets_handover_keep_identity(tmp_path):
+    cam = tmp_path / "cam"
+    # Old track of the female dies 3 frames after the new one starts.
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=1,
+        frame_idx=range(0, 103),
+        identity_probs={"bird_1": 0.9, "bird_2": 0.1},
+    )
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=2,
+        frame_idx=range(100, 400),
+        identity_probs={"bird_1": 0.9, "bird_2": 0.1},
+    )
+    # Meanwhile the male is present the whole time.
+    write_tracklet_csv(
+        cam,
+        label="bird",
+        track_id=3,
+        frame_idx=range(0, 400),
+        identity_probs={"bird_1": 0.1, "bird_2": 0.9},
+    )
+    run_link([cam])
+    df = pd.read_csv(cam / "identity_assignment.csv", index_col="track_id")
+    # Strict overlap: 1 and 2 may not both be bird_1. The solver keeps
+    # the longer one and the old track loses its identity.
+    assert df.loc[2, "identity"] == "bird_1"
+    assert pd.isna(df.loc[1, "identity"])
+    run_link([cam], overwrite=True, min_overlap=10)
+    df = pd.read_csv(cam / "identity_assignment.csv", index_col="track_id")
+    assert df.loc[1, "identity"] == "bird_1"
+    assert df.loc[2, "identity"] == "bird_1"
+    assert df.loc[3, "identity"] == "bird_2"
+
+
+# ---------------------------------------------------------------------------
+# Non-overlapping camera pairs (cross-camera exclusivity)
+# ---------------------------------------------------------------------------
+
+
+def _two_cams_same_bird(tmp_path):
+    """Nest and mirror both see a 'bird_1'-looking bird at the same time."""
+    nest = tmp_path / "nestCam"
+    mirror = tmp_path / "mirrorCam"
+    write_tracklet_csv(
+        nest,
+        label="bird",
+        track_id=1,
+        frame_idx=range(50),
+        identity_probs={"bird_1": 0.95, "bird_2": 0.05},
+    )
+    write_tracklet_csv(
+        mirror,
+        label="bird",
+        track_id=1,
+        frame_idx=range(50),
+        identity_probs={"bird_1": 0.7, "bird_2": 0.3},
+    )
+    return nest, mirror
+
+
+def test_exclusive_pairs_force_different_identities(tmp_path):
+    nest, mirror = _two_cams_same_bird(tmp_path)
+    run_link([nest, mirror])
+    a = pd.read_csv(nest / "identity_assignment.csv", index_col="track_id")
+    b = pd.read_csv(mirror / "identity_assignment.csv", index_col="track_id")
+    assert a.loc[1, "identity"] == b.loc[1, "identity"] == "bird_1"
+    run_link([nest, mirror], overwrite=True, exclusive=[("nestCam", "*")])
+    a = pd.read_csv(nest / "identity_assignment.csv", index_col="track_id")
+    b = pd.read_csv(mirror / "identity_assignment.csv", index_col="track_id")
+    assert a.loc[1, "identity"] == "bird_1"
+    assert b.loc[1, "identity"] == "bird_2"  # by elimination
+    report = json.loads((nest / "link_report.json").read_text())
+    assert report["exclusive_pairs"] == ["mirrorCam:nestCam"]
+
+
+def test_exclusive_pairs_read_from_cameras_json(tmp_path):
+    from octron.cameras import Camera, CameraLayout
+
+    nest, mirror = _two_cams_same_bird(tmp_path)
+    layout = CameraLayout(
+        cameras=[
+            Camera("nestCam", 0, 0, 10, 10),
+            Camera("mirrorCam", 10, 0, 20, 10),
+        ],
+        frame_width=20,
+        frame_height=10,
+        non_overlapping=[["nestCam", "*"]],
+    )
+    layout.validate()
+    layout.save(tmp_path / "cameras.json")
+    run_link([nest, mirror])
+    b = pd.read_csv(mirror / "identity_assignment.csv", index_col="track_id")
+    assert b.loc[1, "identity"] == "bird_2"

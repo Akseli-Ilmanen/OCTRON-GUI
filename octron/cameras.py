@@ -191,6 +191,12 @@ class CameraLayout:
         Provenance: the video this layout was created for.
     video_hash : str, optional
         Provenance: a hash of the video this layout was created for.
+    non_overlapping : list of [str, str], optional
+        Pairs of camera names whose fields of view do not overlap, so
+        one animal can never be seen in both at the same time.
+        ``"*"`` stands for every other camera (``["nestCam", "*"]``).
+        ``octron link`` turns these into cross-camera exclusivity
+        constraints; pairs not listed are assumed to overlap.
 
     """
 
@@ -199,6 +205,7 @@ class CameraLayout:
     frame_height: int = 0
     video_file_path: str | None = None
     video_hash: str | None = None
+    non_overlapping: list = field(default_factory=list)
 
     # -- construction ------------------------------------------------
 
@@ -309,6 +316,11 @@ class CameraLayout:
             "video_file_path": self.video_file_path,
             "video_hash": self.video_hash,
             "cameras": [cam.to_dict() for cam in self.cameras],
+            **(
+                {"non_overlapping": [list(p) for p in self.non_overlapping]}
+                if self.non_overlapping
+                else {}
+            ),
         }
 
     @classmethod
@@ -320,7 +332,32 @@ class CameraLayout:
             frame_height=int(d["frame_height"]),
             video_file_path=d.get("video_file_path"),
             video_hash=d.get("video_hash"),
+            non_overlapping=[
+                [str(a), str(b)] for a, b in (d.get("non_overlapping") or [])
+            ],
         )
+
+    def exclusive_pairs(self) -> set:
+        """Expand ``non_overlapping`` into concrete camera-name pairs.
+
+        Returns
+        -------
+        set of frozenset
+            Every unordered pair ``{a, b}`` of distinct camera names
+            declared non-overlapping, with ``"*"`` expanded to all other
+            cameras.
+
+        """
+        names = list(self.names)
+        pairs = set()
+        for a, b in self.non_overlapping:
+            left = names if a == "*" else [a]
+            right = names if b == "*" else [b]
+            for x in left:
+                for y in right:
+                    if x != y:
+                        pairs.add(frozenset((x, y)))
+        return pairs
 
     @classmethod
     def load(cls, path) -> "CameraLayout":
@@ -381,6 +418,19 @@ class CameraLayout:
         """
         if not self.cameras:
             raise ValueError("CameraLayout has no cameras.")
+
+        known = {cam.name for cam in self.cameras}
+        for pair in self.non_overlapping:
+            if len(pair) != 2:
+                raise ValueError(
+                    f"non_overlapping entries must be [name, name], got "
+                    f"{pair!r}."
+                )
+            for name in pair:
+                if name != "*" and name not in known:
+                    raise ValueError(
+                        f"non_overlapping names unknown camera {name!r}."
+                    )
 
         seen_names = set()
         for cam in self.cameras:

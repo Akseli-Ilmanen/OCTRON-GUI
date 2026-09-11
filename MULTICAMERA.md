@@ -119,13 +119,33 @@ octron link ... --global                                  # non-overlapping rigs
 For every camera, `link` sums the identity probabilities of each
 tracklet and solves an exact integer program (`scipy.optimize.milp`):
 one identity per tracklet, and an identity may not be held by two
-tracklets that overlap in time in the same camera. `--global` extends
-the constraint across cameras, which is right only when fields of view
-do not overlap. Results go to `identity_assignment.csv` and
+tracklets that overlap in time in the same camera. Cameras whose fields
+of view do not overlap can be declared in `cameras.json`:
+
+```json
+"non_overlapping": [["nestCam", "*"]]
+```
+
+(`"*"` = every other camera). `link` reads the `cameras.json` next to
+the folders and adds the same constraint between those camera pairs,
+so a bird in the nest and a bird in a mirror at the same time are
+different individuals; `--exclusive nestCam:mirrorMain` (repeatable)
+does the same from the command line. Pairs not listed are assumed to
+overlap. `--global` applies the constraint between every pair, which is
+right only when no fields of view overlap at all. Results go to `identity_assignment.csv` and
 `link_report.json` in each folder; tracklets whose best identity is
 less than `--min-margin` (default 1.5) times the runner-up are flagged
-for review, as are unassigned ones. `YOLO_results.get_identity_assignment()`
-reads the CSV back.
+for review, as are unassigned ones. With `--min-evidence N` a tracklet
+whose best summed score exceeds the runner-up by fewer than `N`
+confident frames is left unassigned (reason `low_evidence`) instead of
+guessed; this keeps a short tracklet seen from a bad angle from getting
+a confident wrong identity, and stops it competing with overlapping
+tracklets. The `evidence` column in the CSV is that difference.
+`--min-overlap N` (default 1) makes two tracklets exclude each other
+only when they share at least `N` frames: a tracker hands one animal
+from a dying track to a new one with a few frames of overlap, and
+treating that as two animals can block a very long tracklet on a
+3-frame artefact; 10 is a good value.
 
 ## 7. Check and improve identity
 
@@ -144,19 +164,22 @@ so `linked_accuracy` (fraction of annotated boxes whose linked identity
 is the annotated one) is the number to watch.
 
 `refine-identity` is the self-training loop of TRex (Walter & Couzin
-2021): every tracklet that `link` assigned without a flag becomes
-pseudo-labelled training crops, provided no unresolved (unassigned or
-flagged) tracklet of the same label was alive at the same time. That
-coexistence rule is the negative-pair idea of idtracker.ai (Torrents et
-al. 2026): two animals visible at once are different individuals, so an
-identity is only certain when its competitors are accounted for. Crops
-go to the `train` split only, spread evenly over each tracklet
-(`--max-per-tracklet`), skipping frames where the classifier strongly
-disagrees with the tracklet (`--min-frame-prob`) and skipping val/test
-frames of the same video. The classifier is then fine-tuned from the
-current `best.pt`. Repeat predict, link, refine until
-`evaluate-identity` stops improving; `--clear` drops pseudo crops of
-earlier rounds.
+2021), restricted to its "global segments": only frames in which every
+individual is present in the camera are used, because there `link`
+decided the identities by exclusivity and elimination rather than by
+the classifier's opinion of a single crop. Measured on all annotated
+frames of the Birdpark mosaic, linked identities were 86-100 % correct
+in such co-existence frames but only 37-88 % correct when one bird was
+alone (the lone male in a mirror was mostly called female); one refine
+round trained on all frames learned that mistake. Each co-existence
+frame yields one crop per individual with the linked identity as
+label, so the export is balanced by construction. Crops go to the
+`train` split only, spread evenly over each tracklet
+(`--max-per-tracklet`), never from val/test frames of the same video.
+The classifier is then fine-tuned from the current `best.pt`. Repeat
+predict, link, refine until `evaluate-identity` stops improving;
+`--all-frames` uses every assigned frame instead, `--clear` drops
+pseudo crops of earlier rounds.
 
 ## 8. Export per-camera datasets for downstream tools
 

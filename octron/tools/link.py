@@ -198,13 +198,20 @@ def build_score_matrix(tracklets, individuals):
     return S
 
 
-def temporal_overlaps(tracklets):
-    """Return pairs ``(i, j)``, ``i < j``, sharing at least one frame.
+def temporal_overlaps(tracklets, min_overlap=1):
+    """Return pairs ``(i, j)``, ``i < j``, sharing ``min_overlap`` frames.
 
     Parameters
     ----------
     tracklets : list of Tracklet
-        Tracklets to check pairwise for a shared frame_idx value.
+        Tracklets to check pairwise for shared frame_idx values.
+    min_overlap : int
+        Minimum number of shared frames for a pair to count as
+        co-existing. A tracker hands a bird over from a dying track to
+        a new one with a few frames of overlap; treating those as two
+        animals would forbid the new track the identity the old one had,
+        which can block a very long tracklet on a 3-frame artefact.
+        ``1`` (default) keeps every overlap.
 
     Returns
     -------
@@ -216,12 +223,30 @@ def temporal_overlaps(tracklets):
     pairs = []
     for i in range(len(tracklets)):
         for j in range(i + 1, len(tracklets)):
-            if not frame_sets[i].isdisjoint(frame_sets[j]):
+            if len(frame_sets[i] & frame_sets[j]) >= min_overlap:
                 pairs.append((i, j))
     return pairs
 
 
-def solve_assignment(tracklets, individuals, overlap_pairs):
+def evidence(scores_row):
+    """Net evidence of a score row: best score minus runner-up score.
+
+    With two individuals of one label the per-frame probabilities sum
+    to one, so the *total* score of a tracklet is just its frame count;
+    only the difference between best and runner-up says how decisive the
+    frames were. A 20-frame tracklet at 0.55/0.45 has evidence 2, one at
+    0.9/0.1 has 16.
+    """
+    scores_row = np.asarray(scores_row, dtype=float)
+    if scores_row.size == 0:
+        return 0.0
+    if scores_row.size == 1:
+        return float(scores_row[0])
+    top = np.sort(scores_row)[-2:]
+    return float(top[1] - top[0])
+
+
+def solve_assignment(tracklets, individuals, overlap_pairs, min_evidence=0.0):
     """Assign at most one individual to each tracklet.
 
     Exact integer program (``scipy.optimize.milp``): variables
@@ -232,7 +257,10 @@ def solve_assignment(tracklets, individuals, overlap_pairs):
 
     Tracklets with an all-zero score row (no identity columns, or
     nothing of their label) are excluded from the program and always
-    come back unassigned.
+    come back unassigned. So are tracklets whose :func:`evidence` (best
+    minus runner-up score) is below ``min_evidence``: a short tracklet
+    seen from a bad angle is then reported as unknown instead of
+    guessed, and it no longer competes with overlapping tracklets.
 
     Parameters
     ----------
@@ -243,6 +271,9 @@ def solve_assignment(tracklets, individuals, overlap_pairs):
     overlap_pairs : list of tuple of int
         Index pairs (into ``tracklets``) that must not share an
         individual, e.g. from :func:`temporal_overlaps`.
+    min_evidence : float
+        Minimum best-minus-runner-up summed score for a tracklet to be
+        assigned at all. ``0`` (default) assigns every scored tracklet.
 
     Returns
     -------
@@ -258,7 +289,9 @@ def solve_assignment(tracklets, individuals, overlap_pairs):
         return result
 
     S = build_score_matrix(tracklets, individuals)
-    included = np.flatnonzero(S.sum(axis=1) > 0)
+    has_scores = S.sum(axis=1) > 0
+    enough = np.array([evidence(row) >= min_evidence for row in S])
+    included = np.flatnonzero(has_scores & enough)
     n_t2 = len(included)
     n_vars = n_t2 * n_i
     if n_vars == 0:
@@ -314,16 +347,21 @@ def solve_assignment(tracklets, individuals, overlap_pairs):
     return result
 
 
-def _folder_overlap_pairs(tracklets, global_exclusive):
-    """Overlap pairs per the ``global_exclusive`` policy.
+def _folder_overlap_pairs(
+    tracklets, global_exclusive, min_overlap=1, exclusive_pairs=()
+):
+    """Overlap pairs per the exclusivity policy.
 
     ``global_exclusive=False`` (default): only tracklets from the same
-    folder (camera) can conflict. ``True``: overlaps are computed across
-    every folder (frame_idx are comparable — synchronised camera tiles
-    of one mosaic video).
+    folder (camera) can conflict, plus tracklets from two folders named
+    in ``exclusive_pairs`` (cameras whose fields of view do not
+    overlap, so one animal cannot be in both at once). ``True``:
+    overlaps are computed across every folder (frame_idx are comparable
+    — synchronised camera tiles of one mosaic video). ``min_overlap``
+    is passed to :func:`temporal_overlaps`.
     """
     if global_exclusive:
-        return temporal_overlaps(tracklets)
+        return temporal_overlaps(tracklets, min_overlap)
 
     by_folder = defaultdict(list)
     for idx, t in enumerate(tracklets):
@@ -332,17 +370,83 @@ def _folder_overlap_pairs(tracklets, global_exclusive):
     pairs = []
     for indices in by_folder.values():
         sub = [tracklets[i] for i in indices]
-        for a, b in temporal_overlaps(sub):
+        for a, b in temporal_overlaps(sub, min_overlap):
             pairs.append((indices[a], indices[b]))
+
+    by_name = {folder.name: indices for folder, indices in by_folder.items()}
+    for pair in exclusive_pairs:
+        a_name, b_name = tuple(pair)
+        if a_name not in by_name or b_name not in by_name:
+            continue
+        ia, ib = by_name[a_name], by_name[b_name]
+        sub = [tracklets[i] for i in ia] + [tracklets[i] for i in ib]
+        mapping = ia + ib
+        for a, b in temporal_overlaps(sub, min_overlap):
+            # keep only cross-folder pairs; same-folder ones are above
+            if (a < len(ia)) != (b < len(ia)):
+                pairs.append((mapping[a], mapping[b]))
     return pairs
 
 
-def _row_report(idx, tracklets, individuals, S, assigned, min_margin):
+def resolve_exclusive_pairs(folders, exclusive=None):
+    """Camera pairs that must not share an individual at the same time.
+
+    Parameters
+    ----------
+    folders : list of Path
+        Camera result folders.
+    exclusive : list of tuple or None
+        Explicit ``(camera_a, camera_b)`` name pairs (``"*"`` allowed).
+        ``None``: read ``non_overlapping`` from the ``cameras.json``
+        next to the folders (their common parent), if present.
+
+    Returns
+    -------
+    set of frozenset
+        Unordered camera-name pairs.
+
+    """
+    from octron.cameras import CAMERAS_FILENAME, CameraLayout
+
+    names = [Path(f).name for f in folders]
+    if exclusive is not None:
+        layout = CameraLayout(
+            cameras=[], non_overlapping=[[a, b] for a, b in exclusive]
+        )
+        pairs = set()
+        for a, b in layout.non_overlapping:
+            left = names if a == "*" else [a]
+            right = names if b == "*" else [b]
+            for x in left:
+                for y in right:
+                    if x != y:
+                        pairs.add(frozenset((x, y)))
+        return pairs
+    parents = {Path(f).resolve().parent for f in folders}
+    pairs = set()
+    for parent in parents:
+        path = parent / CAMERAS_FILENAME
+        if not path.exists():
+            continue
+        try:
+            layout = CameraLayout.load(path)
+        except Exception as e:
+            logger.warning(f"Could not read {path}: {e}")
+            continue
+        pairs |= layout.exclusive_pairs()
+    return pairs
+
+
+def _row_report(
+    idx, tracklets, individuals, S, assigned, min_margin, min_evidence=0.0
+):
     """Build the per-tracklet output row shared by the CSV and JSON report."""
     tracklet = tracklets[idx]
     scores_row = S[idx]
+    a = assigned[idx]
     total = float(scores_row.sum())
     order = np.argsort(scores_row)[::-1]
+    net = evidence(scores_row)
 
     frame_idx = tracklet.frame_idx
     first_frame = int(frame_idx.min()) if len(frame_idx) else None
@@ -354,7 +458,6 @@ def _row_report(idx, tracklets, individuals, S, assigned, min_margin):
         margin_ratio = 0.0
         reason = "no_identity_scores"
     else:
-        a = assigned[idx]
         candidates = [i for i in order if i != a]
         runner_up = individuals[candidates[0]] if candidates else None
         runner_up_score = (
@@ -363,7 +466,7 @@ def _row_report(idx, tracklets, individuals, S, assigned, min_margin):
         if a is None:
             identity, score = None, 0.0
             margin_ratio = 0.0
-            reason = "unassigned"
+            reason = "low_evidence" if net < min_evidence else "unassigned"
         else:
             identity = individuals[a]
             score = float(scores_row[a])
@@ -383,6 +486,7 @@ def _row_report(idx, tracklets, individuals, S, assigned, min_margin):
         "runner_up": runner_up,
         "runner_up_score": runner_up_score,
         "margin_ratio": margin_ratio,
+        "evidence": net,
         "n_frames": tracklet.n_frames,
         "first_frame": first_frame,
         "last_frame": last_frame,
@@ -391,7 +495,15 @@ def _row_report(idx, tracklets, individuals, S, assigned, min_margin):
     }
 
 
-def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
+def run_link(
+    folders,
+    min_margin=1.5,
+    global_exclusive=False,
+    overwrite=False,
+    min_evidence=0.0,
+    min_overlap=1,
+    exclusive=None,
+):
     """Assign identities to every tracklet across one or more camera folders.
 
     Loads every tracklet in ``folders``, solves one exact assignment
@@ -417,6 +529,22 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
         Overwrite existing ``identity_assignment.csv`` /
         ``link_report.json`` outputs. Default ``False`` (raises
         ``FileExistsError``).
+    min_evidence : float
+        Tracklets whose best-minus-runner-up summed score is below this
+        are left unassigned (reason ``"low_evidence"``) instead of
+        guessed. In units of confident frames; ``0`` disables.
+    min_overlap : int
+        Two tracklets only exclude each other from sharing an
+        individual when they share at least this many frames. Tracker
+        hand-overs produce a few frames of overlap between the old and
+        the new track of one animal; ``1`` (default) treats those as two
+        animals, ``10`` or so ignores them.
+    exclusive : list of tuple or None
+        Camera-name pairs whose fields of view do not overlap, so a
+        tracklet in one and a tracklet in the other alive at the same
+        time are different animals. ``None`` (default) reads
+        ``non_overlapping`` from the ``cameras.json`` next to the
+        folders. Ignored with ``global_exclusive``.
 
     Returns
     -------
@@ -460,8 +588,18 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
         individuals.update(_load_identity_classes(folder).keys())
     individuals = sorted(individuals)
 
-    overlap_pairs = _folder_overlap_pairs(all_tracklets, global_exclusive)
-    assigned = solve_assignment(all_tracklets, individuals, overlap_pairs)
+    exclusive_pairs = resolve_exclusive_pairs(folders, exclusive)
+    if exclusive_pairs and not global_exclusive:
+        logger.info(
+            "Non-overlapping camera pairs (cross-camera exclusivity): "
+            + ", ".join(sorted(":".join(sorted(p)) for p in exclusive_pairs))
+        )
+    overlap_pairs = _folder_overlap_pairs(
+        all_tracklets, global_exclusive, min_overlap, exclusive_pairs
+    )
+    assigned = solve_assignment(
+        all_tracklets, individuals, overlap_pairs, min_evidence=min_evidence
+    )
     S = build_score_matrix(all_tracklets, individuals)
 
     by_folder = defaultdict(list)
@@ -470,7 +608,12 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
 
     summary = {
         "min_margin": min_margin,
+        "min_evidence": min_evidence,
+        "min_overlap": min_overlap,
         "global_exclusive": global_exclusive,
+        "exclusive_pairs": sorted(
+            ":".join(sorted(p)) for p in exclusive_pairs
+        ),
         "n_tracklets": len(all_tracklets),
         "n_assigned": sum(1 for a in assigned if a is not None),
         "n_flagged": 0,
@@ -482,7 +625,13 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
         indices = by_folder.get(folder, [])
         rows = [
             _row_report(
-                idx, all_tracklets, individuals, S, assigned, min_margin
+                idx,
+                all_tracklets,
+                individuals,
+                S,
+                assigned,
+                min_margin,
+                min_evidence,
             )
             for idx in indices
         ]
@@ -498,6 +647,7 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
             "runner_up",
             "runner_up_score",
             "margin_ratio",
+            "evidence",
             "n_frames",
             "first_frame",
             "last_frame",
@@ -515,7 +665,10 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
         n_flagged = sum(1 for row in rows if row["flagged"])
         report = {
             "min_margin": min_margin,
+            "min_evidence": min_evidence,
+            "min_overlap": min_overlap,
             "global_exclusive": global_exclusive,
+            "exclusive_pairs": summary["exclusive_pairs"],
             "n_tracklets": len(rows),
             "n_assigned": n_assigned,
             "n_flagged": n_flagged,
@@ -527,6 +680,8 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
                     "identity": row["identity"],
                     "reason": row["reason"],
                     "margin_ratio": row["margin_ratio"],
+                    "evidence": row["evidence"],
+                    "n_frames": row["n_frames"],
                 }
                 for row in rows
                 if row["flagged"]
@@ -552,6 +707,7 @@ def run_link(folders, min_margin=1.5, global_exclusive=False, overwrite=False):
         f"Linked {summary['n_tracklets']} tracklet(s) across {len(folders)} "
         f"folder(s): {summary['n_assigned']} assigned, "
         f"{summary['n_flagged']} flagged (min_margin={min_margin}, "
+        f"min_evidence={min_evidence}, min_overlap={min_overlap}, "
         f"global_exclusive={global_exclusive})."
     )
     return summary

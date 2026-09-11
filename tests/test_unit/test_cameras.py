@@ -627,3 +627,51 @@ def test_split_video_builds_even_crops(tmp_path, monkeypatch):
         )
         == 2
     )
+
+
+# ---------------------------------------------------------------------------
+# non_overlapping camera pairs
+# ---------------------------------------------------------------------------
+
+
+def test_non_overlapping_roundtrip_and_expansion(tmp_path):
+    from octron.cameras import Camera, CameraLayout
+
+    layout = CameraLayout(
+        cameras=[
+            Camera("nest", 0, 0, 10, 10),
+            Camera("left", 10, 0, 20, 10),
+            Camera("right", 20, 0, 30, 10),
+        ],
+        frame_width=30,
+        frame_height=10,
+        non_overlapping=[["nest", "*"]],
+    )
+    layout.validate()
+    assert layout.exclusive_pairs() == {
+        frozenset({"nest", "left"}),
+        frozenset({"nest", "right"}),
+    }
+    path = layout.save(tmp_path / "cameras.json")
+    back = CameraLayout.load(path)
+    assert back.non_overlapping == [["nest", "*"]]
+    # layouts without the key serialise exactly as before
+    plain = CameraLayout(
+        cameras=layout.cameras, frame_width=30, frame_height=10
+    )
+    assert "non_overlapping" not in plain.to_dict()
+
+
+def test_non_overlapping_unknown_name_rejected():
+    import pytest
+
+    from octron.cameras import Camera, CameraLayout
+
+    layout = CameraLayout(
+        cameras=[Camera("nest", 0, 0, 10, 10)],
+        frame_width=10,
+        frame_height=10,
+        non_overlapping=[["nest", "ghost"]],
+    )
+    with pytest.raises(ValueError, match="unknown camera"):
+        layout.validate()

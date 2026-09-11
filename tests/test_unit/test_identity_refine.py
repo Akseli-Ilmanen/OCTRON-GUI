@@ -43,6 +43,10 @@ def _metadata(folder, video_path, camera=None, padding=0.1):
         "video_info": {"original_video_path": str(video_path)},
         "camera": camera,
         "identity": {"padding": padding},
+        "identity_classes": {
+            "bird_1": {"label": "bird", "suffix": "1"},
+            "bird_2": {"label": "bird", "suffix": "2"},
+        },
     }
     with open(folder / "prediction_metadata.json", "w") as f:
         json.dump(meta, f)
@@ -81,53 +85,20 @@ def _assign_df(rows):
     ).set_index("track_id")
 
 
-def test_select_keeps_assigned_unflagged_without_conflict():
-    obs = _obs((1, "bird", range(10)), (2, "bird", range(10)))
-    assignment = _assign_df(
-        [(1, "bird", "bird_1", False), (2, "bird", "bird_2", False)]
-    )
-    selected, rejected = refine.select_pseudo_tracklets(assignment, obs)
-    assert selected == {1: "bird_1", 2: "bird_2"}
-    assert rejected == {}
-
-
-def test_select_rejects_unassigned_and_flagged():
-    obs = _obs((1, "bird", range(5)), (2, "bird", range(20, 25)))
-    assignment = _assign_df(
-        [(1, "bird", np.nan, True), (2, "bird", "bird_2", True)]
-    )
-    selected, rejected = refine.select_pseudo_tracklets(assignment, obs)
-    assert selected == {}
-    assert rejected == {1: "unassigned", 2: "flagged"}
-
-
-def test_select_rejects_when_unresolved_neighbour_overlaps():
-    # Track 3 is alive with track 1 and unresolved: 1 could be wrong.
+def test_select_takes_every_assigned_tracklet():
     obs = _obs(
-        (1, "bird", range(10)),
-        (2, "bird", range(20, 30)),
-        (3, "bird", range(5, 8)),
+        (1, "bird", range(10)), (2, "bird", range(10)), (3, "bird", range(5))
     )
     assignment = _assign_df(
         [
             (1, "bird", "bird_1", False),
-            (2, "bird", "bird_1", False),
+            (2, "bird", "bird_2", True),  # flagged still counts
             (3, "bird", np.nan, True),
         ]
     )
     selected, rejected = refine.select_pseudo_tracklets(assignment, obs)
-    assert selected == {2: "bird_1"}
-    assert rejected[1] == "unresolved_neighbour"
-    assert rejected[3] == "unassigned"
-
-
-def test_select_ignores_unresolved_neighbour_of_other_label():
-    obs = _obs((1, "bird", range(10)), (3, "mouse", range(10)))
-    assignment = _assign_df(
-        [(1, "bird", "bird_1", False), (3, "mouse", np.nan, True)]
-    )
-    selected, _ = refine.select_pseudo_tracklets(assignment, obs)
-    assert selected == {1: "bird_1"}
+    assert selected == {1: "bird_1", 2: "bird_2"}
+    assert rejected == {3: "unassigned"}
 
 
 # ---------------------------------------------------------------------------
@@ -141,28 +112,18 @@ def _track(frames, probs):
     return df
 
 
-def test_frames_filtered_by_min_prob_and_excluded():
+def test_frames_keep_all_but_excluded():
     df = _track(range(6), [0.9, 0.1, 0.9, 0.9, 0.05, 0.9])
     chosen = refine.select_pseudo_frames(
-        df,
-        "bird_1",
-        min_frame_prob=0.2,
-        max_per_tracklet=0,
-        exclude_frames={5},
+        df, "bird_1", max_per_tracklet=0, exclude_frames={5}
     )
-    assert chosen["frame_idx"].tolist() == [0, 2, 3]
+    assert chosen["frame_idx"].tolist() == [0, 1, 2, 3, 4]
 
 
 def test_frames_subsampled_evenly():
     df = _track(range(100), [1.0] * 100)
     chosen = refine.select_pseudo_frames(df, "bird_1", max_per_tracklet=5)
     assert chosen["frame_idx"].tolist() == [0, 25, 50, 74, 99]
-
-
-def test_frames_zero_min_prob_keeps_all():
-    df = _track(range(4), [0.0, 0.0, 0.0, 0.0])
-    chosen = refine.select_pseudo_frames(df, "bird_1", min_frame_prob=0.0)
-    assert len(chosen) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +218,11 @@ def test_export_pseudo_crops_writes_train_only_and_skips_test_frames(
     )
     video = _FakeVideo()
     summary = refine.export_pseudo_crops(
-        project, [pred], max_per_tracklet=0, open_video=lambda p: video
+        project,
+        [pred],
+        max_per_tracklet=0,
+        coexistence_only=False,
+        open_video=lambda p: video,
     )
     out = sorted((data / "train" / "bird_1").glob("pseudo_*.png"))
     names = [p.name for p in out]
@@ -302,3 +267,61 @@ def test_export_requires_dataset(tmp_path):
 def test_load_identity_assignment_missing(tmp_path):
     with pytest.raises(FileNotFoundError, match="octron link"):
         refine.load_identity_assignment(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# coexistence_frames: only frames where every individual is present
+# ---------------------------------------------------------------------------
+
+
+def test_coexistence_frames_requires_all_individuals():
+    obs = _obs((1, "bird", range(0, 10)), (2, "bird", range(5, 15)))
+    linked = {1: "bird_1", 2: "bird_2"}
+    frames = refine.coexistence_frames(
+        obs, linked, {"bird": {"bird_1", "bird_2"}}
+    )
+    assert frames == set(range(5, 10))
+    # an unassigned second tracklet does not count
+    assert (
+        refine.coexistence_frames(
+            obs, {1: "bird_1", 2: None}, {"bird": {"bird_1", "bird_2"}}
+        )
+        == set()
+    )
+    # a label with a single individual never qualifies
+    assert (
+        refine.coexistence_frames(obs, linked, {"bird": {"bird_1"}}) == set()
+    )
+    assert (
+        refine.coexistence_frames(
+            obs.iloc[0:0], linked, {"bird": {"bird_1", "bird_2"}}
+        )
+        == set()
+    )
+
+
+def test_export_coexistence_only_uses_shared_frames(tmp_path):
+    project, data = _project_with_dataset(tmp_path)
+    pred = tmp_path / "pred" / "cam"
+    pred.mkdir(parents=True)
+    write_tracklet_csv(pred, label="bird", track_id=1, frame_idx=range(0, 10))
+    write_tracklet_csv(pred, label="bird", track_id=2, frame_idx=range(6, 20))
+    _assignment(
+        pred, [(1, "bird", "bird_1", False), (2, "bird", "bird_2", False)]
+    )
+    _metadata(pred, tmp_path / "videos" / "clip.mp4")
+    (data / "train" / "bird_2").mkdir()
+    summary = refine.export_pseudo_crops(
+        project, [pred], max_per_tracklet=0, open_video=lambda p: _FakeVideo()
+    )
+    # shared frames 6..9; frame 2 (test) is outside them anyway
+    got_1 = sorted(
+        int(p.stem.split("_")[-1])
+        for p in (data / "train" / "bird_1").glob("pseudo_*")
+    )
+    got_2 = sorted(
+        int(p.stem.split("_")[-1])
+        for p in (data / "train" / "bird_2").glob("pseudo_*")
+    )
+    assert got_1 == [6, 7, 8, 9] and got_2 == [6, 7, 8, 9]
+    assert summary["n_coexistence_frames"][pred.as_posix()] == 4

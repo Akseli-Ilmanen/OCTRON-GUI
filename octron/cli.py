@@ -698,6 +698,22 @@ def train_identity(
     padding: float = typer.Option(
         0.1, help="Fractional crop padding around each mask box."
     ),
+    train_fraction: float | None = typer.Option(
+        None,
+        "--train",
+        help=(
+            "Fraction of annotated frames for training (default: "
+            "config.yaml; test split = remainder)."
+        ),
+    ),
+    val_fraction: float | None = typer.Option(
+        None,
+        "--val",
+        help=(
+            "Fraction of annotated frames for validation (default: "
+            "config.yaml)."
+        ),
+    ),
     overwrite: bool = typer.Option(
         False,
         "--overwrite",
@@ -729,6 +745,8 @@ def train_identity(
         padding=padding,
         overwrite=overwrite,
         skip_export=skip_export,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
         verbose=verbose,
     )
 
@@ -745,15 +763,6 @@ def refine_identity(
             "identity_assignment.csv from `octron link`."
         ),
     ),
-    min_frame_prob: float = typer.Option(
-        0.2,
-        "--min-frame-prob",
-        help=(
-            "Skip frames whose per-frame probability for the assigned "
-            "identity is below this (guards against swaps inside a "
-            "tracklet). 0 keeps every frame."
-        ),
-    ),
     max_per_tracklet: int = typer.Option(
         50,
         "--max-per-tracklet",
@@ -763,6 +772,16 @@ def refine_identity(
         False,
         "--clear",
         help="Delete pseudo crops from earlier refine rounds first.",
+    ),
+    coexistence_only: bool = typer.Option(
+        True,
+        "--coexistence-only/--all-frames",
+        help=(
+            "Use only frames in which every individual is present in "
+            "the camera, where the linked identities are decided by "
+            "exclusivity rather than by the classifier alone "
+            "(default). --all-frames uses every assigned frame."
+        ),
     ),
     model: str | None = typer.Option(
         None,
@@ -781,23 +800,25 @@ def refine_identity(
         False, "--export-only", help="Export pseudo crops, do not retrain."
     ),
 ):
-    """Self-train the identity classifier on confidently linked tracklets.
+    """Self-train the identity classifier on linked tracklets.
 
-    Crops of every tracklet that `octron link` assigned without a flag
-    and that has no unresolved (unassigned/flagged) neighbour of the
-    same label alive at the same time are added to the train split of
-    the identity dataset, and the classifier is retrained. Val/test
-    frames of the same video are never used. Repeat predict -> link ->
-    refine-identity until `octron evaluate-identity` stops improving.
+    Crops are taken from frames in which every individual is present
+    in the camera: there `octron link` decided the identities by
+    exclusivity and elimination, so the labels hold even where the
+    classifier itself is wrong. Crops go to the train split of the
+    identity dataset, spread evenly over each tracklet; val/test frames
+    of the same video are never used. Then the classifier is
+    retrained. Repeat predict -> link -> refine-identity until
+    `octron evaluate-identity` stops improving.
     """
     from octron.tools.identity import run_refine_identity
 
     run_refine_identity(
         project_path=project_path,
         folders=folders,
-        min_frame_prob=min_frame_prob,
         max_per_tracklet=max_per_tracklet,
         clear=clear,
+        coexistence_only=coexistence_only,
         model=model,
         imgsz=imgsz,
         epochs=epochs,
@@ -861,6 +882,36 @@ def link(
             "below this ratio."
         ),
     ),
+    min_evidence: float = typer.Option(
+        0.0,
+        "--min-evidence",
+        help=(
+            "Leave a tracklet unassigned (reason 'low_evidence') when "
+            "its best summed identity score exceeds the runner-up by "
+            "less than this many confident frames. 0 assigns every "
+            "scored tracklet."
+        ),
+    ),
+    min_overlap: int = typer.Option(
+        1,
+        "--min-overlap",
+        help=(
+            "Two tracklets exclude each other from one individual only "
+            "when they share at least this many frames. Raise to ~10 to "
+            "ignore the few-frame overlap a tracker leaves when it hands "
+            "one animal from a dying track to a new one."
+        ),
+    ),
+    exclusive: list[str] | None = typer.Option(
+        None,
+        "--exclusive",
+        help=(
+            "Camera pair 'A:B' whose fields of view do not overlap "
+            "(repeatable; 'A:*' = A against every other camera). "
+            "Default: the non_overlapping list in the cameras.json "
+            "next to the folders."
+        ),
+    ),
     global_exclusive: bool = typer.Option(
         False,
         "--global",
@@ -899,11 +950,24 @@ def link(
     """
     from octron.tools.link import run_link
 
+    pairs = None
+    if exclusive:
+        pairs = []
+        for item in exclusive:
+            if ":" not in item:
+                raise typer.BadParameter(
+                    f"Expected 'A:B', got {item!r}", param_hint="'--exclusive'"
+                )
+            a, b = item.split(":", 1)
+            pairs.append((a.strip(), b.strip()))
     run_link(
         folders=folders,
         min_margin=min_margin,
         global_exclusive=global_exclusive,
         overwrite=overwrite,
+        min_evidence=min_evidence,
+        min_overlap=min_overlap,
+        exclusive=pairs,
     )
     if netcdf:
         from octron.tools.export_nc import run_export_nc

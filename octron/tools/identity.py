@@ -134,9 +134,9 @@ def run_train_identity(
 def run_refine_identity(
     project_path,
     folders,
-    min_frame_prob=0.2,
     max_per_tracklet=50,
     clear=False,
+    coexistence_only=True,
     model=None,
     imgsz=224,
     epochs=30,
@@ -146,9 +146,9 @@ def run_refine_identity(
 ):
     """Self-train the identity classifier on linked tracklets.
 
-    Exports crops of every trusted tracklet (assigned, unflagged, no
-    unresolved neighbour; see
-    :func:`octron.yolo_octron.identity_refine.select_pseudo_tracklets`)
+    Exports crops of assigned tracklets, from frames in which every
+    individual is present in the camera (see
+    :func:`octron.yolo_octron.identity_refine.coexistence_frames`),
     into the ``train`` split of the identity dataset and retrains the
     classifier on the union of hand-labelled and pseudo-labelled crops.
 
@@ -158,13 +158,13 @@ def run_refine_identity(
         OCTRON project directory (identity dataset must exist).
     folders : list of str or Path
         Linked prediction folders (after ``octron link``).
-    min_frame_prob : float
-        Drop frames whose per-frame probability for the assigned
-        identity is below this value.
     max_per_tracklet : int
         Crops per tracklet, spread evenly (0: all).
     clear : bool
         Remove pseudo crops from earlier rounds first.
+    coexistence_only : bool
+        Use only frames where every individual of a label is present in
+        the camera (labels there are decided by exclusivity).
     model : str or Path or None
         Weights to start from. None continues from the current
         ``best.pt`` when it exists, else ``yolo11n-cls``.
@@ -195,9 +195,9 @@ def run_refine_identity(
     summary = export_pseudo_crops(
         project_path,
         folders,
-        min_frame_prob=min_frame_prob,
         max_per_tracklet=max_per_tracklet,
         clear=clear,
+        coexistence_only=coexistence_only,
     )
     n_crops = sum(summary["n_crops"].values())
     per_class = ", ".join(
@@ -205,19 +205,10 @@ def run_refine_identity(
     )
     print(
         f"Exported {n_crops} pseudo-labelled crop(s) from "
-        f"{summary['n_selected']} trusted tracklet(s) "
-        f"({summary['n_rejected']} rejected)"
+        f"{summary['n_selected']} assigned tracklet(s) "
+        f"({summary['n_rejected']} unassigned skipped)"
         + (f": {per_class}" if per_class else ".")
     )
-    reasons = {}
-    for rej in summary["rejected"].values():
-        for reason in rej.values():
-            reasons[reason] = reasons.get(reason, 0) + 1
-    if reasons:
-        print(
-            "Rejected tracklets: "
-            + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
-        )
     if export_only or n_crops == 0:
         if n_crops == 0:
             print("Nothing to train on; classifier unchanged.")

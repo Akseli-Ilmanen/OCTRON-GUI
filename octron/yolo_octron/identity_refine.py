@@ -7,21 +7,27 @@ crops with a known identity. This module turns those into extra
 training crops and retrains the classifier on the union, the
 "uniqueness feedback" loop of TRex (Walter & Couzin 2021, eLife).
 
-Which tracklets are trusted
----------------------------
-A tracklet is a pseudo-label source when ``octron link`` assigned it an
-identity without flagging it, *and* no unresolved tracklet of the same
-label overlaps it in time (see :func:`select_pseudo_tracklets`). The
-second rule uses the coexistence structure of the tracklets the way
-idtracker.ai (Torrents et al. 2026, eLife) samples negative pairs: two
-tracklets alive at the same time are different animals, so an identity
-is only certain when every competitor alive at the same time has been
-accounted for.
+Which frames are used
+---------------------
+Only *co-existence* frames: frames in which every individual of a
+label has been assigned to a tracklet in that camera at the same time
+(TRex's "global segments", Walter & Couzin 2021). There the linked
+identities are decided by exclusivity and elimination, not by the
+classifier's opinion of a single crop, and they are reliable even
+where the classifier is systematically wrong. Measured on the Birdpark
+mosaic (2026-09-11, all annotated frames): linked accuracy 0.86-1.00
+in co-existence frames versus 0.37-0.88 when one bird was alone, where
+the lone male was called female most of the time. Training on the
+lone-bird frames poisoned one refine round; training on co-existence
+frames cannot, and it is balanced by construction (every individual is
+present in every used frame).
 
-Pseudo crops are written into the ``train`` split only; ``val`` and
-``test`` stay hand-labelled. Frames that belong to the ``val``/``test``
-split of the same video are never exported, so
-``octron evaluate-identity`` on those frames remains honest.
+Frames are spread evenly over each tracklet (``max_per_tracklet``) so
+one very long tracklet does not dominate the class. Pseudo crops are
+written into the ``train`` split only; ``val`` and ``test`` stay
+hand-labelled, and frames of the same video that belong to those
+splits are never exported, so ``octron evaluate-identity`` on them
+remains honest.
 """
 
 import json
@@ -139,39 +145,26 @@ def _frame_sets(obs):
     }
 
 
-def select_pseudo_tracklets(assignment, obs):
-    """Pick the tracklets whose identity is certain enough to train on.
-
-    A tracklet qualifies when
-
-    * ``octron link`` assigned it an identity and did not flag it, and
-    * no *unresolved* tracklet of the same label (unassigned or flagged)
-      shares a frame with it. Such a neighbour could be the true holder
-      of the identity, so the assignment is not verified by exclusion.
+def select_pseudo_tracklets(assignment, obs=None):
+    """Return the tracklets to train on: every assigned one.
 
     Parameters
     ----------
     assignment : pandas.DataFrame
-        ``identity_assignment.csv`` indexed by ``track_id`` with columns
-        ``label, identity, flagged``.
-    obs : pandas.DataFrame
-        Per-frame observations from :func:`load_tracklet_frames`.
+        ``identity_assignment.csv`` indexed by ``track_id`` with an
+        ``identity`` column.
+    obs : pandas.DataFrame or None
+        Unused; kept so callers may pass the observations.
 
     Returns
     -------
     selected : dict
-        ``{track_id: identity}`` for the trusted tracklets.
+        ``{track_id: identity}`` for every assigned tracklet.
     rejected : dict
-        ``{track_id: reason}`` for the rest, reason in
-        ``{"unassigned", "flagged", "unresolved_neighbour"}``.
+        ``{track_id: "unassigned"}`` for the rest.
 
     """
-    frames = _frame_sets(obs)
-    labels = {
-        int(tid): str(g["label"].iloc[0]) for tid, g in obs.groupby("track_id")
-    }
     selected, rejected = {}, {}
-    resolved, unresolved = {}, set()
     for tid, row in assignment.iterrows():
         tid = int(tid)
         identity = row.get("identity")
@@ -179,34 +172,14 @@ def select_pseudo_tracklets(assignment, obs):
             isinstance(identity, float) and np.isnan(identity)
         ):
             rejected[tid] = "unassigned"
-            unresolved.add(tid)
-        elif bool(row.get("flagged", False)):
-            rejected[tid] = "flagged"
-            unresolved.add(tid)
         else:
-            resolved[tid] = str(identity)
-
-    for tid, identity in resolved.items():
-        my_frames = frames.get(tid, set())
-        my_label = labels.get(tid, str(assignment.loc[tid].get("label")))
-        conflict = False
-        for other in unresolved:
-            if labels.get(other) != my_label:
-                continue
-            if not my_frames.isdisjoint(frames.get(other, set())):
-                conflict = True
-                break
-        if conflict:
-            rejected[tid] = "unresolved_neighbour"
-        else:
-            selected[tid] = identity
+            selected[tid] = str(identity)
     return selected, rejected
 
 
 def select_pseudo_frames(
     track_obs,
     identity,
-    min_frame_prob=0.2,
     max_per_tracklet=50,
     exclude_frames=None,
 ):
@@ -218,12 +191,8 @@ def select_pseudo_frames(
         Observations of a single tracklet (rows of
         :func:`load_tracklet_frames` with one ``track_id``).
     identity : str
-        Identity class name assigned to the tracklet.
-    min_frame_prob : float
-        Drop frames whose per-frame classifier probability for
-        ``identity`` is below this value. This guards against a swap
-        inside the tracklet: frames that clearly show someone else are
-        not labelled as ``identity``. ``0`` keeps every frame.
+        Identity class name assigned to the tracklet (unused, kept for
+        symmetry with the caller).
     max_per_tracklet : int
         At most this many frames, spread evenly over the tracklet, so
         one long tracklet does not dominate the class. ``0`` means no
@@ -240,9 +209,6 @@ def select_pseudo_frames(
     obs = track_obs.sort_values("frame_idx")
     if exclude_frames:
         obs = obs[~obs["frame_idx"].isin(exclude_frames)]
-    col = IDENTITY_PROB_PREFIX + identity
-    if min_frame_prob > 0 and col in obs.columns:
-        obs = obs[obs[col].fillna(0.0) >= min_frame_prob]
     if max_per_tracklet and len(obs) > max_per_tracklet:
         pick = (
             np.linspace(0, len(obs) - 1, max_per_tracklet).round().astype(int)
@@ -331,15 +297,60 @@ def _open_video(video_path):
     return FastVideoReader(video_path, read_format="rgb24")
 
 
+def coexistence_frames(obs, linked, individuals_per_label):
+    """Frames in which every individual of a label is assigned at once.
+
+    Parameters
+    ----------
+    obs : pandas.DataFrame
+        Observations (:func:`load_tracklet_frames`) of one camera.
+    linked : dict
+        ``{track_id: identity or None}`` from ``identity_assignment.csv``.
+    individuals_per_label : dict
+        ``{label: set of identity class names}`` known to the
+        classifier (from ``prediction_metadata.json``).
+
+    Returns
+    -------
+    set of int
+        Frame indices where, for at least one label, all of its
+        individuals are present (assigned to distinct tracklets).
+
+    """
+    if len(obs) == 0:
+        return set()
+    df = obs[["frame_idx", "track_id", "label"]].copy()
+    df["identity"] = df["track_id"].map(linked)
+    df = df.dropna(subset=["identity"])
+    frames = set()
+    for (frame_idx, label), g in df.groupby(["frame_idx", "label"]):
+        wanted = individuals_per_label.get(str(label))
+        if not wanted or len(wanted) < 2:
+            continue
+        if set(g["identity"]) >= wanted:
+            frames.add(int(frame_idx))
+    return frames
+
+
+def _individuals_per_label(folder):
+    """``{label: set(classname)}`` from ``prediction_metadata.json``."""
+    meta = load_prediction_metadata(folder)
+    out = {}
+    for name, info in (meta.get("identity_classes") or {}).items():
+        if isinstance(info, dict) and "label" in info:
+            out.setdefault(str(info["label"]), set()).add(name)
+    return out
+
+
 def export_pseudo_crops(
     project_path,
     folders,
-    min_frame_prob=0.2,
     max_per_tracklet=50,
     clear=False,
+    coexistence_only=True,
     open_video=_open_video,
 ):
-    """Write crops of trusted tracklets into the identity train split.
+    """Write crops of assigned tracklets into the identity train split.
 
     Parameters
     ----------
@@ -347,10 +358,13 @@ def export_pseudo_crops(
         OCTRON project (the identity dataset must exist).
     folders : list of str or Path
         Prediction folders (one per camera) that have been linked.
-    min_frame_prob, max_per_tracklet
+    max_per_tracklet : int
         See :func:`select_pseudo_frames`.
     clear : bool
         Remove previously exported pseudo crops first.
+    coexistence_only : bool
+        Use only frames in which every individual of a label is present
+        in the camera (see :func:`coexistence_frames`). Default True.
     open_video : callable
         ``open_video(path) -> indexable frames`` (tests inject a stub).
 
@@ -381,6 +395,7 @@ def export_pseudo_crops(
         "rejected": {},
         "n_cleared": clear_pseudo_crops(data_path) if clear else 0,
     }
+    summary["n_coexistence_frames"] = {}
     for folder in folders:
         video_path, camera, padding = folder_video_and_camera(folder)
         obs = load_tracklet_frames(folder)
@@ -390,7 +405,7 @@ def export_pseudo_crops(
         summary["n_rejected"] += len(rejected)
         summary["rejected"][folder.as_posix()] = rejected
         if not selected:
-            logger.info(f"{folder.name}: no trusted tracklets")
+            logger.info(f"{folder.name}: no assigned tracklets")
             continue
 
         subfolder = find_project_subfolder(project_path, video_path)
@@ -399,13 +414,22 @@ def export_pseudo_crops(
             held_out = split_frames(data_path, subfolder)
             exclude = held_out["val"] | held_out["test"]
 
-        # Gather (frame -> rows) so every frame is decoded once.
+        allowed = None
+        if coexistence_only:
+            linked = {tid: ident for tid, ident in selected.items()}
+            allowed = coexistence_frames(
+                obs, linked, _individuals_per_label(folder)
+            )
+            summary["n_coexistence_frames"][folder.as_posix()] = len(allowed)
+
         rows = []
         for tid, identity in selected.items():
+            track_obs = obs[obs["track_id"] == tid]
+            if allowed is not None:
+                track_obs = track_obs[track_obs["frame_idx"].isin(allowed)]
             chosen = select_pseudo_frames(
-                obs[obs["track_id"] == tid],
+                track_obs,
                 identity,
-                min_frame_prob=min_frame_prob,
                 max_per_tracklet=max_per_tracklet,
                 exclude_frames=exclude,
             )
@@ -432,7 +456,12 @@ def export_pseudo_crops(
                 summary["n_crops"].get(identity, 0) + 1
             )
         logger.info(
-            f"{folder.name}: {len(selected)} trusted tracklet(s), "
-            f"{len(rows)} crop(s), {len(rejected)} rejected"
+            f"{folder.name}: {len(selected)} assigned tracklet(s), "
+            f"{len(rows)} crop(s)"
+            + (
+                f" from {len(allowed)} co-existence frame(s)"
+                if allowed is not None
+                else ""
+            )
         )
     return summary
