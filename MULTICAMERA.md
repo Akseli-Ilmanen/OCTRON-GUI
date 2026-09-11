@@ -127,7 +127,78 @@ less than `--min-margin` (default 1.5) times the runner-up are flagged
 for review, as are unassigned ones. `YOLO_results.get_identity_assignment()`
 reads the CSV back.
 
+## 7. Check and improve identity
+
+```bash
+octron evaluate-identity <project> octron_predictions/mosaic_ByteTrack/*/
+octron refine-identity   <project> octron_predictions/mosaic_ByteTrack/*/
+```
+
+`evaluate-identity` scores the linked tracklets against the annotated
+masks of the same video, on the `test` split of the identity dataset
+only (`--split val|all` to change), and writes `identity_eval.json`
+per camera. It reports IDF1 (Ristani et al. 2016) for three id schemes:
+raw BoxMOT track ids, the per-frame classifier argmax, and the linked
+identity. IDF1 rewards consistency and is blind to a systematic swap,
+so `linked_accuracy` (fraction of annotated boxes whose linked identity
+is the annotated one) is the number to watch.
+
+`refine-identity` is the self-training loop of TRex (Walter & Couzin
+2021): every tracklet that `link` assigned without a flag becomes
+pseudo-labelled training crops, provided no unresolved (unassigned or
+flagged) tracklet of the same label was alive at the same time. That
+coexistence rule is the negative-pair idea of idtracker.ai (Torrents et
+al. 2026): two animals visible at once are different individuals, so an
+identity is only certain when its competitors are accounted for. Crops
+go to the `train` split only, spread evenly over each tracklet
+(`--max-per-tracklet`), skipping frames where the classifier strongly
+disagrees with the tracklet (`--min-frame-prob`) and skipping val/test
+frames of the same video. The classifier is then fine-tuned from the
+current `best.pt`. Repeat predict, link, refine until
+`evaluate-identity` stops improving; `--clear` drops pseudo crops of
+earlier rounds.
+
+## 8. Export per-camera datasets for downstream tools
+
+```bash
+octron link octron_predictions/mosaic_ByteTrack/*/ --netcdf   # link + export
+octron export-nc octron_predictions/mosaic_ByteTrack             # export only
+```
+
+Writes one `<camera>.nc` per camera into the prediction folder, a
+movement-style bounding-box dataset with dimensions
+`(time, space, individual)`: `position`, `shape` (width, height),
+`confidence`, `identity_conf`, `track_id` and `flagged`. Individuals are
+the linked identities (`bird_male`, `bird_female`) on the same axis in
+every file of a video, so the files can be concatenated on a `camera`
+dimension downstream. Unassigned tracklets are left out and counted in
+the attributes; flagged ones are kept with `flagged = 1`. Positions are
+in camera-crop pixels; the camera name and its rectangle in the mosaic
+are attributes (`camera`, `camera_x_min`, ...), as are the mosaic video
+name and size. Needs `pip install octron[export]` (xarray, netCDF4).
+
+To get one video file per camera that matches those coordinates with
+no offset, cut the mosaic once:
+
+```bash
+octron cameras cameras.json --split-video mosaic.mp4    # -> cameras_video/<camera>.mp4
+```
+
+Odd rectangle sizes lose one pixel at the right/bottom edge (H.264 needs
+even dimensions).
+
 ## Notes on tracker settings
+
+For the species-detector + identity workflow a motion-only tracker
+(ByteTrack, OcSort) is enough and is what we recommend: the identity
+classifier is trained on these individuals and `link` resolves
+identities with an exact exclusivity constraint, which a generic
+re-identification embedding inside the tracker does not add to. Tune
+the tracker to *fragment* at crossings rather than bridge them (short
+`max_age`, strict matching): a fragmented but pure tracklet is stitched
+by `link`, while a tracklet that swaps animals mid-way keeps one
+identity for its whole length and cannot be repaired downstream. The
+ReID trackers remain available for other workflows.
 
 `per_class` keeps BoxMOT from matching a track to detections of another
 class. OCTRON enables it by default for every tracker except BoostTrack

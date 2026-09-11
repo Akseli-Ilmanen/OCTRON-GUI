@@ -292,12 +292,45 @@ def cameras(
             "bounds, size) and any overlap warnings; nothing is written."
         ),
     ),
+    split_video: Path | None = typer.Option(
+        None,
+        "--split-video",
+        help=(
+            "Cut this mosaic video into one <camera>.mp4 per camera "
+            "(ffmpeg), so per-camera tracking output applies to the clip "
+            "with no offset. Written to --output-dir or "
+            "<video dir>/cameras_video."
+        ),
+    ),
+    output_dir: Path | None = typer.Option(
+        None, "--output-dir", "-o", help="Directory for --split-video clips."
+    ),
+    encoder: str = typer.Option(
+        "auto",
+        "--encoder",
+        help="Video encoder for --split-video: auto, nvenc or libx264.",
+    ),
 ):
-    """Validate a cameras.json, or distribute it to a project/videos."""
+    """Validate a cameras.json, distribute it, or cut a mosaic per camera."""
     from octron.cameras import CameraLayout, apply_cameras
 
     layout = CameraLayout.load(cameras_json)
     layout.validate()
+
+    if split_video is not None:
+        from octron.cameras import split_video as _split_video
+
+        clips = _split_video(
+            split_video,
+            layout,
+            output_dir=output_dir,
+            encoder=encoder,
+            overwrite=force,
+        )
+        typer.echo("Wrote camera clips:")
+        for clip in clips:
+            typer.echo(f"  {Path(clip).as_posix()}")
+        return
 
     if show:
         header = (
@@ -700,6 +733,116 @@ def train_identity(
     )
 
 
+@app.command("refine-identity")
+def refine_identity(
+    project_path: Path = typer.Argument(
+        ..., help="Path to the OCTRON project directory."
+    ),
+    folders: list[Path] = typer.Argument(
+        ...,
+        help=(
+            "Linked prediction folders (one per camera) with "
+            "identity_assignment.csv from `octron link`."
+        ),
+    ),
+    min_frame_prob: float = typer.Option(
+        0.2,
+        "--min-frame-prob",
+        help=(
+            "Skip frames whose per-frame probability for the assigned "
+            "identity is below this (guards against swaps inside a "
+            "tracklet). 0 keeps every frame."
+        ),
+    ),
+    max_per_tracklet: int = typer.Option(
+        50,
+        "--max-per-tracklet",
+        help="Crops per tracklet, spread evenly over its frames (0: all).",
+    ),
+    clear: bool = typer.Option(
+        False,
+        "--clear",
+        help="Delete pseudo crops from earlier refine rounds first.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        help=(
+            "Weights to start from. Default: the current best.pt "
+            "(fine-tune), or yolo11n-cls if none exists."
+        ),
+    ),
+    imgsz: int = typer.Option(224, help="Classifier input size."),
+    epochs: int = typer.Option(30, help="Number of training epochs."),
+    device: Device | None = typer.Option(
+        None, help="Device to train on (default: config.yaml)."
+    ),
+    batch: int = typer.Option(-1, help="Batch size (-1: automatic)."),
+    export_only: bool = typer.Option(
+        False, "--export-only", help="Export pseudo crops, do not retrain."
+    ),
+):
+    """Self-train the identity classifier on confidently linked tracklets.
+
+    Crops of every tracklet that `octron link` assigned without a flag
+    and that has no unresolved (unassigned/flagged) neighbour of the
+    same label alive at the same time are added to the train split of
+    the identity dataset, and the classifier is retrained. Val/test
+    frames of the same video are never used. Repeat predict -> link ->
+    refine-identity until `octron evaluate-identity` stops improving.
+    """
+    from octron.tools.identity import run_refine_identity
+
+    run_refine_identity(
+        project_path=project_path,
+        folders=folders,
+        min_frame_prob=min_frame_prob,
+        max_per_tracklet=max_per_tracklet,
+        clear=clear,
+        model=model,
+        imgsz=imgsz,
+        epochs=epochs,
+        device=device.value if device is not None else None,
+        batch=batch,
+        export_only=export_only,
+    )
+
+
+@app.command("evaluate-identity")
+def evaluate_identity(
+    project_path: Path = typer.Argument(
+        ..., help="Path to the OCTRON project directory."
+    ),
+    folders: list[Path] = typer.Argument(
+        ..., help="Linked prediction folders (one per camera)."
+    ),
+    split: str = typer.Option(
+        "test",
+        "--split",
+        help=(
+            "Which annotated frames to score: 'test' (default), 'val' "
+            "or 'all' (includes frames the classifier trained on)."
+        ),
+    ),
+    iou_thresh: float = typer.Option(
+        0.5, "--iou", help="Minimum IoU to match a box to an annotation."
+    ),
+):
+    """Score linked tracklets against the annotations (IDF1, accuracy).
+
+    Reports IDF1 for raw track ids, per-frame classifier identity and
+    linked identity, plus the fraction of annotated boxes whose linked
+    identity is correct. Writes identity_eval.json into each folder.
+    """
+    from octron.tools.identity import run_evaluate_identity
+
+    run_evaluate_identity(
+        project_path=project_path,
+        folders=folders,
+        split=split,
+        iou_thresh=iou_thresh,
+    )
+
+
 @app.command()
 def link(
     folders: list[Path] = typer.Argument(
@@ -735,6 +878,16 @@ def link(
             "link_report.json outputs. Default: refuse if they exist."
         ),
     ),
+    netcdf: bool = typer.Option(
+        False,
+        "--netcdf",
+        help=(
+            "After linking, export one NetCDF dataset per camera "
+            "(<camera>.nc, dims time/space/individual) into the parent "
+            "prediction folder; see 'octron export-nc'. Requires xarray "
+            "(octron[export])."
+        ),
+    ),
 ):
     """Assign identities to tracklets across one or more camera folders.
 
@@ -752,6 +905,51 @@ def link(
         global_exclusive=global_exclusive,
         overwrite=overwrite,
     )
+    if netcdf:
+        from octron.tools.export_nc import run_export_nc
+
+        parents = sorted({Path(f).resolve().parent for f in folders})
+        if len(folders) == 1:
+            parents = [Path(folders[0]).resolve()]
+        for parent in parents:
+            run_export_nc(parent, overwrite=overwrite)
+
+
+@app.command("export-nc")
+def export_nc(
+    source: Path = typer.Argument(
+        ...,
+        help=(
+            "Mosaic prediction folder (contains cameras.json and one "
+            "subfolder per camera, each linked with 'octron link'), or "
+            "a single camera folder."
+        ),
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Directory for the <camera>.nc files. Default: <source>.",
+    ),
+    fps: float | None = typer.Option(
+        None,
+        "--fps",
+        help="Frame rate for the time axis (default: prediction metadata).",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace an existing output file."
+    ),
+):
+    """Export linked tracks as one NetCDF per camera (movement bboxes).
+
+    Each <camera>.nc has dimensions (time, space, individual) with
+    position, shape, confidence, identity_conf, track_id and flagged.
+    Positions are in camera-crop pixels; the camera name and rectangle
+    are stored in the attributes.
+    """
+    from octron.tools.export_nc import run_export_nc
+
+    run_export_nc(source, output_dir=output_dir, fps=fps, overwrite=overwrite)
 
 
 @app.command("dump-tracker-config")

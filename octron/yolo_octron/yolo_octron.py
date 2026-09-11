@@ -2267,6 +2267,12 @@ class YOLO_octron:
                     save_period=save_period,
                     exist_ok=True,
                     nms=False,
+                    # ultralytics >= 8.4.142 copies pretrained head rows
+                    # for class names that also exist in the checkpoint
+                    # (e.g. a label 'bird' matches COCO's 'bird'). That
+                    # path fails with a CPU/CUDA device mismatch and a
+                    # fine-tune gains nothing from it, so keep it off.
+                    cls_remap=False,
                     # Increasing this for dense scenes - I think it
                     # might affect val too
                     max_det=2000,
@@ -4064,6 +4070,157 @@ class YOLO_octron:
 
         return df
 
+    def _load_mosaic_predictions(
+        self, save_dir, layout, sigma_tracking_pos=2, open_viewer=True
+    ):
+        """Load per-camera predictions of a mosaic video into one viewer.
+
+        Each camera folder holds tracks and masks in camera-crop
+        coordinates; they are shifted by the camera rectangle so they
+        overlay the mosaic video. Layer names carry the camera, and the
+        identity from ``octron link`` when ``identity_assignment.csv``
+        exists.
+
+        Yields
+        ------
+        Same six objects as :meth:`load_predictions`, with the label
+        prefixed by the camera name.
+
+        """
+        save_dir = Path(save_dir)
+        # Find the mosaic video: prediction metadata first, then the
+        # usual "<stem>_<tracker>" lookup one and two levels up.
+        video_path = None
+        for cam in layout:
+            meta = save_dir / cam.name / "prediction_metadata.json"
+            if meta.exists():
+                with open(meta) as f:
+                    candidate = (
+                        json.load(f)
+                        .get("video_info", {})
+                        .get("original_video_path")
+                    )
+                if candidate and Path(candidate).exists():
+                    video_path = Path(candidate)
+                    break
+        if video_path is None:
+            stem = "_".join(save_dir.name.split("_")[:-1])
+            for d in (save_dir.parent, save_dir.parent.parent):
+                hit = next(iter(sorted(d.glob(f"{stem}.mp4"))), None)
+                if hit is not None:
+                    video_path = hit
+                    break
+
+        viewer = None
+        if open_viewer:
+            viewer = napari.Viewer()
+            if video_path is not None:
+                from napari_pyav._reader import FastVideoReader
+
+                from octron.sam_octron.helpers.video_loader import probe_video
+
+                video_dict = probe_video(video_path, verbose=False)
+                viewer.add_image(
+                    FastVideoReader(video_path, read_format="rgb24"),
+                    name=video_dict["video_name"],
+                    metadata=video_dict,
+                )
+            else:
+                logger.warning(
+                    "Mosaic video not found; showing tracks on an empty "
+                    "background."
+                )
+                viewer.add_image(
+                    np.zeros((layout.frame_height, layout.frame_width)),
+                    name="mosaic",
+                )
+            # Camera rectangles as a reference
+            rects = [
+                np.array(
+                    [
+                        [c.y_min, c.x_min],
+                        [c.y_min, c.x_max],
+                        [c.y_max, c.x_max],
+                        [c.y_max, c.x_min],
+                    ]
+                )
+                for c in layout
+            ]
+            viewer.add_shapes(
+                rects,
+                shape_type="rectangle",
+                edge_color="yellow",
+                face_color="transparent",
+                edge_width=2,
+                name="cameras",
+                features={"name": list(layout.names)},
+                text={"string": "{name}", "color": "yellow", "size": 10},
+            )
+
+        for cam in layout:
+            cam_dir = save_dir / cam.name
+            if not cam_dir.is_dir():
+                continue
+            results = YOLO_results(cam_dir, verbose=False)
+            if not results.csvs:
+                continue
+            identities = results.get_identity_assignment()
+            tracking = results.get_tracking_data(
+                interpolate=True,
+                interpolate_method="linear",
+                interpolate_limit=None,
+                sigma=sigma_tracking_pos,
+            )
+            mask_data = results.get_mask_data() if results.has_masks else {}
+            for track_id, label in results.track_id_label.items():
+                if track_id not in tracking:
+                    continue
+                color, cmap = results.get_color_for_track_id(track_id)
+                df = tracking[track_id]["data"].copy()
+                df["pos_y"] = df["pos_y"] + cam.y_min
+                df["pos_x"] = df["pos_x"] + cam.x_min
+                features = tracking[track_id]["features"]
+                masks = (
+                    mask_data[track_id]["data"]
+                    if track_id in mask_data
+                    else None
+                )
+                name = f"{cam.name} {label} - id {track_id}"
+                if identities is not None and track_id in identities.index:
+                    ident = identities.loc[track_id, "identity"]
+                    if isinstance(ident, str) and ident:
+                        name += f" [{ident}]"
+                if viewer is not None:
+                    if masks is not None:
+                        viewer.add_labels(
+                            masks,
+                            name=f"{name} MASKS",
+                            opacity=0.5,
+                            blending="translucent",
+                            colormap=cmap,
+                            translate=(0, cam.y_min, cam.x_min),
+                        )
+                    layer = viewer.add_tracks(
+                        df.values,
+                        features=features.to_dict(orient="list"),
+                        blending="translucent",
+                        name=name,
+                        colormap="hsv",
+                    )
+                    layer.tail_width = 3
+                    layer.tail_length = min(results.num_frames or 250, 250)
+                    layer.color_by = "frame_idx"
+                yield (
+                    f"{cam.name}/{label}",
+                    track_id,
+                    color,
+                    df,
+                    features,
+                    masks,
+                )
+        if viewer is not None:
+            viewer.dims.set_point(0, 0)
+
     def load_predictions(
         self,
         save_dir,
@@ -4103,6 +4260,15 @@ class YOLO_octron:
 
 
         """
+        save_dir = Path(save_dir)
+        mosaic_layout = load_layout_for_folder(save_dir)
+        if mosaic_layout is not None and any(
+            (save_dir / cam.name).is_dir() for cam in mosaic_layout
+        ):
+            yield from self._load_mosaic_predictions(
+                save_dir, mosaic_layout, sigma_tracking_pos, open_viewer
+            )
+            return
         yolo_results = YOLO_results(save_dir)
         track_id_label = yolo_results.track_id_label
         assert track_id_label is not None, (

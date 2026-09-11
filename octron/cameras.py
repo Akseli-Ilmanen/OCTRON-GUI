@@ -40,6 +40,7 @@ Example ``cameras.json``::
 """
 
 import json
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -728,4 +729,89 @@ def apply_cameras(
     for video in videos:
         _write(sibling_cameras_path(video))
 
+    return written
+
+
+def split_video(
+    video_path,
+    layout,
+    output_dir=None,
+    encoder="auto",
+    crf=20,
+    overwrite=False,
+    cameras=None,
+):
+    """Cut a mosaic video into one clip per camera with ffmpeg.
+
+    Each clip is the camera rectangle of the mosaic, so positions in
+    that camera's tracking output (CSV or ``<camera>.nc``) apply to the
+    clip without any offset. H.264 needs even dimensions, so an odd
+    width or height is rounded down by one pixel.
+
+    Parameters
+    ----------
+    video_path : str or Path
+        Mosaic video.
+    layout : CameraLayout
+        Camera rectangles.
+    output_dir : str or Path, optional
+        Where to write ``<camera>.mp4``; default ``<video dir>/cameras_video``.
+    encoder : str
+        ``'auto'`` (GPU if available), ``'nvenc'`` or ``'libx264'``.
+    crf : int
+        Quality (lower is better; ``-cq`` for nvenc).
+    overwrite : bool
+        Replace existing clips.
+    cameras : list of str, optional
+        Subset of camera names; default all.
+
+    Returns
+    -------
+    list of Path
+        Written clips, in layout order.
+
+    """
+    from octron.tools._ffmpeg import h264_codec_args, resolve_encoder
+
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+    output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else video_path.parent / "cameras_video"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    encoder_name = resolve_encoder(encoder)
+    written = []
+    for cam in layout:
+        if cameras is not None and cam.name not in cameras:
+            continue
+        out = output_dir / f"{cam.name}.mp4"
+        if out.exists() and not overwrite:
+            logger.warning(f"Skipping existing {out} (pass overwrite=True)")
+            continue
+        width = cam.width - (cam.width % 2)
+        height = cam.height - (cam.height % 2)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"crop={width}:{height}:{cam.x_min}:{cam.y_min}",
+            *h264_codec_args(encoder_name, crf=crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(out),
+        ]
+        logger.info(
+            f"Cutting {cam.name}: {width}x{height} at "
+            f"({cam.x_min}, {cam.y_min}) -> {out}"
+        )
+        subprocess.run(cmd, check=True)
+        written.append(out)
     return written

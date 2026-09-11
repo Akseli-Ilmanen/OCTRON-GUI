@@ -587,3 +587,43 @@ def test_apply_cameras_validates_source_before_writing(tmp_path):
     with pytest.raises(ValueError):
         apply_cameras(bad_path, videos=[video])
     assert not sibling_cameras_path(video).exists()
+
+
+def test_split_video_builds_even_crops(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import octron.cameras as cameras_mod
+
+    video = tmp_path / "mosaic.mp4"
+    video.write_bytes(b"")
+    layout = CameraLayout(
+        cameras=[Camera("a", 0, 0, 41, 31), Camera("b", 41, 0, 80, 30)],
+        frame_width=80,
+        frame_height=31,
+    )
+    calls = []
+
+    def fake_run(cmd, check):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(cameras_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "octron.tools._ffmpeg.resolve_encoder", lambda e: "libx264"
+    )
+    out = cameras_mod.split_video(video, layout, output_dir=tmp_path / "v")
+    assert [p.name for p in out] == ["a.mp4", "b.mp4"]
+    assert "crop=40:30:0:0" in calls[0]  # odd 41x31 rounded down
+    assert "crop=38:30:41:0" in calls[1]
+    # existing clips are skipped unless overwrite
+    assert (
+        cameras_mod.split_video(video, layout, output_dir=tmp_path / "v") == []
+    )
+    assert (
+        len(
+            cameras_mod.split_video(
+                video, layout, output_dir=tmp_path / "v", overwrite=True
+            )
+        )
+        == 2
+    )

@@ -515,18 +515,28 @@ def train_identity(
         f"{data_path} ({epochs} epochs, imgsz={imgsz}, device={device})"
     )
     yolo.train(
-        data=data_path.as_posix(),
+        data=data_path.resolve().as_posix(),
         epochs=epochs,
         imgsz=imgsz,
         device=device,
         batch=batch if batch > 0 else 16,
-        project=root.as_posix(),
+        project=root.resolve().as_posix(),
         name=run_dir.name,
         exist_ok=True,
         verbose=False,
         plots=False,
     )
     best = run_dir / "weights" / "best.pt"
+    # ultralytics may place the run elsewhere (e.g. under its runs_dir
+    # when the project path is relative); trust the trainer's record.
+    trainer_best = getattr(getattr(yolo, "trainer", None), "best", None)
+    if not best.exists() and trainer_best and Path(trainer_best).exists():
+        best.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(trainer_best, best)
+        last = Path(trainer_best).with_name("last.pt")
+        if last.exists():
+            shutil.copy(last, best.with_name("last.pt"))
+        logger.info(f"Copied weights from {Path(trainer_best).parent}")
     if not best.exists():
         raise RuntimeError(f"Training finished but {best} is missing.")
     # Keep the class metadata next to the weights so predict can find

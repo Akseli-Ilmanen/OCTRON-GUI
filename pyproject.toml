@@ -75,6 +75,7 @@ keywords = [
 pyqt5 = ["PyQt5>=5.15.11"]
 pyqt6 = ["PyQt6>=6.10.0"]
 all = ["napari[pyqt6]==0.8.0"]
+export = ["xarray>=2024.1", "netCDF4>=1.6"]
 dev = [
     "pytest>=7.0",
     "pytest-cov",

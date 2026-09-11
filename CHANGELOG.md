@@ -4,6 +4,9 @@
 - Multi-camera mosaics: `cameras.json` per video (drawn in the GUI or applied with `octron cameras`); `octron predict` assigns detections to cameras by box centre and tracks each camera separately into `<output>/<camera>/`.
 - Identity classifier: `octron train-identity` trains a YOLO classification model on `(label, suffix)` crops; `octron predict --identity` adds `identity`, `identity_conf` and `identity_prob_*` columns to the tracking CSVs.
 - `octron link`: exact per-camera exclusivity assignment of identities to tracklets (`scipy.optimize.milp`), with `--global` for non-overlapping rigs and review flags; `YOLO_results.get_identity_assignment()`.
+- `octron export-nc` / `octron link --netcdf`: one movement-style NetCDF dataset per camera (`<camera>.nc`, dims time/space/individual) of the linked tracks for downstream tools (`octron[export]` extra).
+- `octron refine-identity`: self-training of the identity classifier on confidently linked tracklets (TRex-style uniqueness feedback with a coexistence rule for trusted tracklets); `octron evaluate-identity`: IDF1 and linked accuracy against the annotated test frames (`identity_eval.json`).
+- Per-camera SAM annotation on mosaic videos (`MosaicPredictor`), camera-aware polygon and identity-crop export, `object_color_mode` setting.
 - See `MULTICAMERA.md` for the full workflow.
 
 ## vers. 0.2
