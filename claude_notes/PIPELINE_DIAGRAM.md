@@ -14,9 +14,9 @@ flowchart TD
     D --> E[tracklet CSVs per camera<br/>frame, box, identity_prob_male, identity_prob_female]
     E --> F[octron link<br/>one identity per tracklet<br/>MILP exclusivity<br/>--min-evidence --min-overlap]
     F --> G[identity_assignment.csv per camera]
-    G --> H[octron evaluate-identity<br/>held-out test frames only<br/>accuracy, IDF1]
+    G --> H[octron evaluate-identity --split all<br/>linked accuracy per camera and bird, IDF1]
     G --> I[octron export-nc<br/>camera.nc for ethograph]
-    G --> J[octron refine-identity<br/>crops of every assigned tracklet<br/>label = linked identity<br/>added to train split<br/>fine-tune classifier]
+    G --> J[octron refine-identity<br/>crops from co-existence frames<br/>label = linked identity<br/>added to train split<br/>fine-tune classifier]
     J -->|new best.pt| D
 ```
 
@@ -68,34 +68,43 @@ Input: all tracklet CSVs of the four camera folders.
    evidence, `flagged` (unassigned, or best < 1.5x runner-up),
    `reason`. `link_report.json` lists the flagged ones.
 
-Not done in `link` (yet): cross-camera exclusivity for non-overlapping
-views (nestCam vs mirrors), duplicate suppression.
+Cross-camera exclusivity for non-overlapping views is available
+(`non_overlapping` in `cameras.json`, or `--exclusive A:B`) but does
+not apply to this rig: the nest is visible in the mirrors. Not done
+(yet): duplicate suppression.
 
 ## What `refine-identity` does
 
 Input: the linked folders. Output: a retrained classifier.
 
-1. For **every tracklet with an identity** (flagged or not; the vote in
-   step 4 above already integrated appearance + exclusivity +
-   elimination), take up to `--max-per-tracklet 50` frames spread evenly
-   over the tracklet.
-2. Skip frames that are in the identity dataset's `val` or `test`
-   split of this video, so `evaluate-identity` stays honest.
+1. Find the **co-existence frames** of each camera: frames in which
+   every individual of a label is assigned to a tracklet there (both
+   birds present). Only these are used: there `link` decided the
+   identities by exclusivity and elimination, and they are 86-100 %
+   correct; lone-bird frames were 37-88 % correct and poisoned the
+   classifier when used.
+2. For every assigned tracklet, take up to `--max-per-tracklet 50` of
+   its co-existence frames, spread evenly. Skip frames that are in the
+   identity dataset's `val` or `test` split of this video.
 3. Cut the same square crop `predict` used (camera crop, box, 10 %
    padding) from the mosaic video and save it as
    `model_identity/training_data/train/<identity>/pseudo_<cam>_<track>_<frame>.png`.
+   One crop per bird per frame, so the export is balanced by construction.
 4. Fine-tune the classifier from the current `best.pt` on hand-labelled
-   + pseudo crops (`train`), validating on the hand-labelled `val`.
+   + pseudo crops (`train`), validating on the hand-labelled `val`
+   (`--epochs`; the first round peaked at epoch 8 of 30).
 5. `predict` again with the new weights, `link`, `evaluate-identity`.
 
-Why no filtering: the crops where the classifier disagrees with the
-tracklet vote (nest-camera male at p_female 0.77) are exactly the ones
-it needs to learn. `--clear` removes pseudo crops of earlier rounds.
+`--all-frames` uses every assigned frame instead; `--clear` removes
+pseudo crops of earlier rounds. Weights of the previous round are kept
+as `model_identity/best_before_refine.pt`.
 
 ## What `evaluate-identity` measures
 
-Only annotated frames in the identity **test** split (15 per camera
-here). For every annotated bird: is there a detection (IoU >= 0.5), and
+By default only annotated frames in the identity **test** split (15 per
+camera here), which is too few to trust: use `--split all` (353
+frames; the classifier saw the train ones, `link` did not). For every
+annotated bird: is there a detection (IoU >= 0.5), and
 is its *linked* identity the annotated one? `acc lnk` is that fraction.
 IDF1 columns say whether the same bird kept the same id (raw track ids
 / per-frame classifier / linked). IDF1 is blind to a consistent swap;

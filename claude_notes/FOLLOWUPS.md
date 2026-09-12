@@ -1,73 +1,81 @@
-# Follow-up PR candidates
+# Follow-ups
 
-Collected while building the multicam-identity branch (2026-09-09/10).
-Each item is meant to be a small, separately reviewable PR against
-upstream OCTRON once the branch has been validated on the Birdpark rig.
+Open items for the multicam-identity branch, updated 2026-09-11. Each
+is meant to be a small, separately reviewable change. Items already
+measured and rejected are listed at the end so they are not rebuilt.
 
-## GUI annotation
+## Identity / link (next)
 
-1. **Undo the last propagation.** After "▷ 15 frames" (or the one-frame
-   step) there is no way to discard what SAM just wrote. Add a button
-   next to the propagation controls that clears the frames written by
-   the last run: remove those frame indices from every object's mask
-   zarr (set to -1 and drop them from `annotated_frames`) and from the
-   per-camera SAM states (`non_cond_frame_outputs` for those frames), so
-   a re-run starts from the last manual prompt. Needs the callback to
-   remember `(start_frame, frame_indices)` of the last propagation, and
-   must work for backward propagation too.
-2. **Propagation length spinner.** `chunk_size` is hard-coded to 15
-   (6 in SAM3 semantic mode) in `main.py`; the button label and the
-   progress bar already read from it. Expose it as a spinbox beside the
-   skip-frames spinbox, persist it in `config.yaml`
-   (`propagation_frames`), and keep the semantic-mode override.
-3. **Projection colours in individual mode.** `sam_layer.py` colours
-   the label projection by label family; with
-   `object_color_mode=individual` it should use each entry's own colour.
-4. **Recolour existing objects when the colour mode changes.** Colours
-   are frozen in the organizer JSON at creation; offer a "reassign
-   colours" action so old projects can adopt `individual` mode.
-5. **Square padding for wide cameras.** Each camera crop (and, before,
-   the full frame) is stretched to the 1024x1024 SAM input. For 2.78:1
-   side cameras that is a strong squeeze; pad to square before encoding
-   instead and un-pad the mask.
-6. **Reload after camera changes.** Saving or loading `cameras.json`
-   after SAM initialised currently requires removing and re-dropping the
-   video. Re-initialise the per-camera stores and states in place.
+1. **Second refine round from `best_refine_coexist.pt`, ~10 epochs.**
+   Round 1 peaked at epoch 8; see whether the right mirror
+   (male 131/183) moves at all. If not, appearance has plateaued there
+   and the remaining flag rate is what it is.
+2. **Per-camera weakness table.** `evaluate-identity --split all`
+   should print correct/matched per (camera, individual) and
+   `train-identity` should print hand-labelled crop counts per
+   (camera, individual) with a note where a combination is thin. The
+   user then decides whether to label more; no automatic balancing.
+3. **`identity_evidence` in the NetCDF export**, the tracklet's
+   best-minus-runner-up score broadcast per frame, and make
+   `identity_conf` the probability of the *exported* identity (today it
+   is the classifier's own per-frame argmax, which can differ).
+4. **Duplicate suppression in `link`.** Two tracklets co-existing with
+   high box IoU over their shared frames are one animal; drop the
+   weaker instead of forcing it onto the other identity. Mirrors have
+   1-9 % of multi-box frames with IoU > 0.5 (nest 20 %, but that is a
+   huddled pair). Also try predict `--iou-thresh 0.5`.
+5. **Classifier as BoxMOT ReID (fallback only).** Export the
+   classifier backbone to TorchScript; blocked on a patch to horsto's
+   boxmot fork (loader keys on the weights filename, crops resized to
+   256x128 BGR). Only if refine rounds stall on flips.
+6. **Report the BoxMOT NumPy bug** (OcSort back-fill interpolation
+   fails on NumPy >= 2.x) to horsto's fork.
 
-## Training
+## Detector
 
-7. **Per-camera crop export for detector training.** Annotate on the
-   mosaic, train on single views (horsto's preference in #87): use
-   `cameras.json` to export one image + label file per camera per frame
-   in `octron split`, behind a `--per-camera` flag.
-8. **Identity classifier in the GUI.** `train-identity` exists only on
-   the CLI; add it to the training tab and let the predict tab pass the
-   identity weights (currently CLI-only via `--identity`).
+7. **Per-camera crop export for detector training** (`octron split
+   --per-camera`, horsto's preference in #87) and per-camera inference:
+   the only route to resolution on the small mirror birds; 4x GPU work,
+   no speed gain.
+8. **Fix annotation gaps** in frames 3085-3096 (unlabelled bird in
+   mirrorMain, fragmented mask in mirrorRight) and retrain; largest
+   expected quality gain overall.
 
-## Tracking / identity
+## GUI
 
-9. **Tracklet change-point split in `octron link`.** Cut a tracklet where
-   confident per-frame identity votes change (prototype:
-   `prototype_split_tracklets.html`), so a swap inside one tracklet does
-   not get the majority identity. Options: confidence floor, minimum run
-   length.
-10. **Classifier embedding as BoxMOT ReID.** Export the identity
-    classifier backbone to TorchScript and use it as `reid_weights`
-    (prototype: `prototype_reid_from_classifier.py`). Blocked on a
-    boxmot-fork patch to accept arbitrary ReID files (filename-based
-    registry) and on matching crop shape / channel order.
-11. **Location prior in `link`.** Optional per-camera prior (e.g. the
-    nest camera is usually the female) as an additive term in the score
-    matrix, replacing the implicit position cue that individual-as-class
-    detectors learn.
-12. **Tracker presets for erratic motion.** Document/ship a DeepOcSort
-    config with short `max_age` for animals that leave the field of view
-    often, so re-entries become new tracklets that `link` resolves
-    instead of wrong revivals.
+9. Undo the last SAM propagation (clear the frames it wrote from every
+   mask zarr and the per-camera SAM states).
+10. Propagation length spinner (`chunk_size` hard-coded to 15, 6 in
+    SAM3 semantic mode), persisted in `config.yaml`.
+11. Projection colours in `individual` colour mode; recolour existing
+    objects when the mode changes.
+12. Square padding for wide cameras before the 1024x1024 SAM encode.
+13. Re-initialise per-camera stores in place after `cameras.json`
+    changes (today: remove and re-drop the video).
+14. Identity classifier in the GUI (train tab + predict tab
+    `--identity`), currently CLI only.
 
 ## Docs / upstream
 
-13. Reply on #87 (draft was in `issue87_reply.md`, since removed) and
-    propose the PR split above.
-14. Move `MULTICAMERA.md` into the OCTRON-docs site once the workflow is
-    accepted.
+15. Reply on #87 with the PR split; move `MULTICAMERA.md` into the
+    OCTRON-docs site once accepted.
+
+## Measured and rejected (do not rebuild)
+
+- Stitching tracklets by continuity in `link` (58 joins, no effect on
+  flips).
+- Per-camera balancing of pseudo-crops by cutting to the smallest
+  group (discards real data; the problem was label noise, solved by
+  co-existence frames).
+- Filters on refine inputs (skip flagged, unresolved neighbour,
+  per-frame disagreement): they removed the elimination-decided
+  crops that fix the lone-male error.
+- Non-overlapping nestCam vs mirrors on this rig (the nest is visible
+  in the mirrors); feature kept for other rigs.
+- Generic OSNet ReID in the tracker (flip rate 24 % -> 41 %).
+- Cross-camera speed correlation as identity signal (no separation for
+  a bonded pair).
+- Tracklet change-point split (swap inside a tracklet): motion-only
+  OcSort keeps swaps rare; revisit only if flips persist with strong
+  evidence on both sides.
+- imgsz 1280 for yolo26m on the 10 GB card (batch 1, mAP50-95 0.29).

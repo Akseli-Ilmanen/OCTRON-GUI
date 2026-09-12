@@ -28,3 +28,16 @@ Use **IDF1** (Ristani et al. 2016), not MOTA: MOTA counts an ID switch once rega
 boxes → motion matcher (1/5) → tracklets → self-supervised embedding trained on tracklet pairs (3, or 2 with crop features) → min-cost-flow stitching with motion + appearance costs (1) → optional long-gap merge by constrained clustering (6).
 
 Off-the-shelf closest fits: `idtrackerai` v6 (gitlab.com/polavieja_lab/idtrackerai, pip), `deeplabcut.transformer_reID` + `stitch_tracklets`. Generic MOT re-ID (BoT-SORT, unsupervised SimpleReID) also applies since detection is solved.
+## What this branch took from the table (2026-09-11)
+
+- Row 4 (TRex): the N-class classifier on crops, hand-labelled seed,
+  and the uniqueness-feedback loop = `octron refine-identity`,
+  restricted to TRex's "global segments" (all individuals present in
+  the camera) after an unrestricted round poisoned the classifier.
+- Row 1 (maDLC stitching): the global assignment with a coexistence
+  constraint = `octron link` (exact MILP instead of min-cost flow,
+  because tracklets that never overlap may share an identity).
+- IDF1 + linked accuracy on all annotated frames = `octron
+  evaluate-identity --split all`.
+- Not taken: rows 2/3/6 (self-supervised embeddings, k-means,
+  constrained clustering) solve the no-labels problem we do not have.
